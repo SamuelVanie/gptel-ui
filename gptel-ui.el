@@ -284,6 +284,7 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
          (name (if (and response (string-match "@[[:alnum:]_-]+" response))
                    (substring (match-string 0 response) 1)
                  gptel-ui-assistant-name))
+         (assistant-prefixes (make-hash-table :test #'eql))
          (pos (point-min)) events assistant-active tool-pending)
     ;; Gather boundaries first, then read them in transcript order.  A tool
     ;; result interrupts the response text property, not the speaker's turn.
@@ -296,6 +297,7 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
           (let ((beg (match-beginning 0)) (end (match-end 0)))
             (unless (or (gptel-ui--skip-p beg end)
                         (and (not (cdr spec)) (eq (get-text-property beg 'gptel) 'response)))
+              (when (cdr spec) (puthash beg t assistant-prefixes))
               (push (list beg end (if (cdr spec) 'assistant-prefix 'user-prefix)
                           (string-suffix-p "\n" (car spec))) events))))))
     (dolist (beg gptel-ui--tool-starts)
@@ -317,9 +319,9 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
             (goto-char pos)
             (skip-chars-forward " \t\n" next)
             (when (and (< (point) next)
-                       (not (cl-some (lambda (event)
-                                       (and (eq (nth 2 event) 'assistant-prefix)
-                                            (= (car event) (point)))) events))
+                       ;; Prefixes are untagged too.  Index their starts so
+                       ;; each boundary need not rescan earlier turn events.
+                       (not (gethash (point) assistant-prefixes))
                        (not (gptel-ui--excluded-p (point) (1+ (point))))
                        (not (cl-some (lambda (ov) (overlay-get ov 'gptel-tool))
                                      (overlays-at (point)))))
