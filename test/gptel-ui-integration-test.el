@@ -193,6 +193,37 @@
                            "An answer.\n"))
             (should-not (text-property-not-all draft (point-max) 'gptel nil))))))))
 
+(ert-deftest gptel-ui-integration-clones-restore-independent-native-headers ()
+  (dolist (mode '(org-mode markdown-mode))
+    (gptel-ui-integration-test--chat mode
+      (insert (propertize "A native response.\n" 'gptel 'response))
+      (let ((gptel-highlight-methods '(face)))
+        (gptel-highlight-mode 1)
+        (gptel-ui-mode 1)
+        (gptel--update-status " Source streaming" 'success)
+        (let ((source (current-buffer))
+              (overlays (copy-sequence gptel-ui--overlays))
+              (native-info (nth 2 gptel-ui--native-header))
+              (clone (clone-buffer " *ui-integration-clone*" nil)))
+          (unwind-protect
+              (progn
+                (with-current-buffer clone
+                  (should gptel-ui-mode)
+                  (should (eq (nth 2 gptel-ui--native-header) native-info))
+                  (gptel--update-status " Clone ready" 'success)
+                  (gptel-ui-mode -1)
+                  (should gptel-highlight-mode)
+                  (should (equal (substring-no-properties (nth 1 header-line-format))
+                                 " Clone ready"))
+                  (gptel-mode -1)
+                  (should (equal header-line-format "Original header")))
+                (should-not gptel-highlight-mode)
+                (should (equal (substring-no-properties (nth 1 header-line-format))
+                               " Source streaming"))
+                (dolist (overlay overlays)
+                  (should (eq (overlay-buffer overlay) source))))
+            (kill-buffer clone)))))))
+
 (ert-deftest gptel-ui-integration-cross-buffer-native-approval-decisions ()
   (let ((gptel-mode-hook nil)
         (gptel-ui-global-mode nil)

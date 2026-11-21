@@ -112,6 +112,7 @@ after changing this option."
 (defvar-local gptel-ui--highlight-was-on nil)
 (defvar-local gptel-ui--native-header nil)
 (defvar-local gptel-ui--installed-header nil)
+(defvar-local gptel-ui--clone-state nil)
 (defvar gptel-ui--approval-cache nil)
 (defvar gptel-ui--approval-cache-dirty t)
 (defvar gptel-ui--watching-approvals nil)
@@ -813,6 +814,72 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
 (defun gptel-ui--disable ()
   "Disable the chat view before a major mode change."
   (gptel-ui-mode -1))
+
+(defun gptel-ui--clone ()
+  "Detach a cloned conversation from its source's presentation ownership."
+  (when gptel-ui-mode
+    (let ((saved gptel-ui--saved)
+          (header (nth 2 (assq 'header-line-format gptel-ui--saved))))
+      ;; Only the header's mutable spine needs copying.  Keep the identities
+      ;; of native info segments and embedded function closures intact.
+      (when (consp header) (setq header (copy-sequence header)))
+      ;; The saved native header can lag behind the displayed status.  Update
+      ;; only the clone's copy, never the source's saved header cons cells.
+      (when (and gptel-ui--native-header
+                 (eq header-line-format gptel-ui--installed-header))
+        (setf (nth 1 header) (nth 1 header-line-format)))
+      ;; These locals were copied by reference.  Do not disable the mode or
+      ;; run its cleanup before dropping the source's overlays and timer.
+      (setq gptel-ui-mode nil
+            gptel-ui--clone-state (list gptel-ui--highlight-was-on)
+            gptel-ui--overlays nil gptel-ui--timer nil
+            gptel-ui--saved nil gptel-ui--window-margins nil
+            gptel-ui--native-header nil gptel-ui--installed-header nil
+            gptel-ui--excluded nil gptel-ui--indexed-ranges nil
+            gptel-ui--range-index [] gptel-ui--turns nil
+            gptel-ui--tool-starts nil gptel-ui--tool-response-starts nil
+            gptel-ui--expanded-reports (copy-sequence gptel-ui--expanded-reports))
+      ;; Optional renderer caches must not retain source-owned link overlays.
+      (dolist (variable '(gptel-ui--link-cache gptel-ui--link-dirty-start))
+        (when (local-variable-p variable) (set variable nil)))
+      ;; Face-remap removal mutates the entry's list spine.  Retain its spec
+      ;; identities for the cookie while making that spine private first.
+      (setq-local face-remapping-alist
+                  (mapcar (lambda (entry)
+                            (cons (car entry)
+                                  (if (consp (cdr entry)) (copy-sequence (cdr entry))
+                                    (cdr entry))))
+                          face-remapping-alist))
+      (when gptel-ui--face-cookie
+        (face-remap-remove-relative gptel-ui--face-cookie))
+      (setq gptel-ui--face-cookie nil)
+      ;; Restore the pre-view settings directly.  In particular, discard the
+      ;; inherited copy-filter wrapper instead of modifying shared advice.
+      (dolist (entry saved)
+        (if (nth 1 entry)
+            (set (make-local-variable (car entry))
+                 (if (eq (car entry) 'header-line-format) header (nth 2 entry)))
+          (kill-local-variable (car entry))))
+      ;; add-hook/remove-hook may edit these lists while the clone is alive.
+      (dolist (hook '(after-change-functions gptel-post-stream-hook
+                      gptel-post-response-functions kill-buffer-hook
+                      change-major-mode-hook))
+        (when (local-variable-p hook)
+          (set hook (copy-sequence (symbol-value hook))))))))
+
+(defun gptel-ui--clone-enable ()
+  "Rebuild the cloned view after other packages have detached native state."
+  (when gptel-ui--clone-state
+    (let ((highlight (car gptel-ui--clone-state)))
+      (setq gptel-ui--clone-state nil)
+      (gptel-ui-mode 1)
+      (setq gptel-ui--highlight-was-on highlight))))
+
+;; Run before other packages' clone hooks can refresh or close the new chat.
+(add-hook 'clone-buffer-hook #'gptel-ui--clone -100)
+(add-hook 'clone-indirect-buffer-hook #'gptel-ui--clone -100)
+(add-hook 'clone-buffer-hook #'gptel-ui--clone-enable 100)
+(add-hook 'clone-indirect-buffer-hook #'gptel-ui--clone-enable 100)
 
 (defun gptel-ui--maybe-enable ()
   "Follow gptel's minor mode in conversation buffers."
