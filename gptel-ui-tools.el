@@ -71,6 +71,113 @@
                       (eq (overlay-get ov 'keymap) gptel-tool-call-actions-map))))
            (overlays-in beg end)))
 
+(defun gptel-ui-tools--pending-approval-p (overlay)
+  "Whether OVERLAY is a live native tool approval, not an inspection copy."
+  (and (overlay-buffer overlay)
+       (overlay-get overlay 'gptel-tool)
+       (boundp 'gptel-tool-call-actions-map)
+       gptel-tool-call-actions-map
+       (eq (overlay-get overlay 'keymap) gptel-tool-call-actions-map)))
+
+(defun gptel-ui-tools--approval-position (overlay)
+  "Return a position at OVERLAY's prompt with native approval keys active."
+  (let* ((start (overlay-start overlay))
+         (end (overlay-end overlay))
+         (prompts (cl-remove-if-not
+                   (lambda (prompt)
+                     (and (overlayp prompt)
+                          (eq (overlay-buffer prompt) (overlay-buffer overlay))
+                          (<= start (overlay-start prompt))
+                          (<= (overlay-start prompt) end)))
+                   (overlay-get overlay 'prompt)))
+         (position (if prompts
+                       (apply #'min (mapcar #'overlay-start prompts))
+                     start)))
+    ;; A custom tool preview can leave a zero-width prompt at the end of the
+    ;; dispatch overlay.  Its keys are active only before that end.
+    (max start (min position (1- end)))))
+
+(defun gptel-ui-tools-pending-approvals ()
+  "Return live native tool approval overlays across all buffers.
+Include hidden subagent buffers, even without `gptel-ui-mode'.  The stable
+order is by buffer name, then prompt position; switching buffers does not
+reorder the queue.  Each overlay represents one native approval group."
+  (let (approvals)
+    (dolist (buffer (sort (buffer-list)
+                         (lambda (left right)
+                           (string< (buffer-name left) (buffer-name right)))))
+      (with-current-buffer buffer
+        ;; Unlike `overlays-in', this also finds prompts outside narrowing.
+        (let* ((lists (overlay-lists))
+               (pending (cl-remove-if-not
+                         #'gptel-ui-tools--pending-approval-p
+                         (append (car lists) (cdr lists)))))
+          (setq approvals
+                (nconc approvals
+                       (sort pending
+                             (lambda (left right)
+                               (< (gptel-ui-tools--approval-position left)
+                                  (gptel-ui-tools--approval-position right)))))))))
+    approvals))
+
+(defvar gptel-ui-tools-navigation-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c ]") #'gptel-ui-next-approval)
+    (define-key map (kbd "C-c [") #'gptel-ui-previous-approval)
+    map)
+  "Temporary navigation bindings when visiting a non-Atelier approval.
+Native approval actions continue to come from the original overlay.")
+
+(defun gptel-ui-tools--keep-navigation-p ()
+  "Keep temporary navigation while cycling or using native approval actions."
+  (memq this-command '(gptel-ui-next-approval gptel-ui-previous-approval
+                      gptel--accept-tool-calls gptel--reject-tool-calls
+                      gptel--steer-tool-calls gptel--inspect-tool-calls)))
+
+(defun gptel-ui-next-approval (&optional previous)
+  "Visit the next pending tool approval across all buffers, wrapping around.
+With PREVIOUS non-nil, visit the previous approval instead.  At the prompt,
+native bindings for `gptel--accept-tool-calls', `gptel--reject-tool-calls',
+`gptel--steer-tool-calls' and `gptel--inspect-tool-calls' remain available.
+No tool is run by moving."
+  (interactive)
+  (let* ((approvals (gptel-ui-tools-pending-approvals))
+         (name (buffer-name))
+         (position (point))
+         (ordered (if previous (reverse approvals) approvals))
+         (target
+          (or (cl-find-if
+               (lambda (overlay)
+                 (let ((other-name (buffer-name (overlay-buffer overlay)))
+                       (other-position (gptel-ui-tools--approval-position overlay)))
+                   (if (equal name other-name)
+                       (if previous (< other-position position)
+                         (> other-position position))
+                     (if previous (string< other-name name)
+                       (string< name other-name)))))
+               ordered)
+              (car ordered))))
+    (unless target (user-error "No pending tool approvals"))
+    (pop-to-buffer (overlay-buffer target))
+    (let ((destination (gptel-ui-tools--approval-position target)))
+      (unless (<= (point-min) destination (point-max)) (widen))
+      (goto-char destination))
+    ;; Hidden worker buffers need not run either gptel or Atelier mode.
+    ;; Keep cycling available there without changing their modes or keymaps.
+    (unless (or (bound-and-true-p gptel-ui-mode)
+                (and (eq (key-binding (kbd "C-c ]")) #'gptel-ui-next-approval)
+                     (eq (key-binding (kbd "C-c [")) #'gptel-ui-previous-approval)))
+      (set-transient-map gptel-ui-tools-navigation-map
+                         #'gptel-ui-tools--keep-navigation-p))
+    (message "Approval %d/%d in %s: C-c C-c accept, C-c C-k cancel"
+             (1+ (cl-position target approvals)) (length approvals) (buffer-name))
+    target))
+
+(defun gptel-ui-previous-approval ()
+  "Visit the previous pending tool approval across all buffers."
+  (interactive)
+  (gptel-ui-next-approval t))
+
 (defun gptel-ui-tools--metadata (beg end)
   "Read the bounded native metadata at BEG, before END, without evaluation.
 Return (PLIST . POSITION) where POSITION ends the serialized metadata."

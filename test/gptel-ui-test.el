@@ -174,7 +174,7 @@
       (setq-local header-line-format native)
       (gptel-ui-mode 1)
       (setf (nth 1 header-line-format) "Streaming")
-      (should (equal (nth 2 header-line-format) '(:eval "Controls")))
+      (should-not (nth 2 header-line-format))
       (gptel-ui-mode -1)
       (should (equal header-line-format '("Backend" "Streaming" (:eval "Controls")))))))
 
@@ -230,6 +230,90 @@
                                            (equal (overlay-get ov 'display) "")))
                         (overlays-at prefix)))
         (should (equal-including-properties text (buffer-string)))))))
+
+(ert-deftest gptel-ui-copy-response-does-not-paste-an-assistant-role ()
+  (gptel-ui-test--buffer
+    (let ((kill-ring nil) (interprogram-cut-function nil)
+          (interprogram-paste-function nil))
+      (insert "@mayuri\n")
+      (let ((beg (point)))
+        (insert (propertize "An answer" 'gptel 'response
+                            'front-sticky '(gptel) 'face 'bold))
+        (gptel-ui-mode 1)
+        (let ((text (buffer-string)))
+          (kill-ring-save beg (point-max))
+          (should (eq (get-text-property 0 'face (car kill-ring)) 'bold))
+          (should-not (get-text-property 0 'front-sticky (car kill-ring)))
+          (should (equal-including-properties text (buffer-string))))
+        (gptel-ui-test--buffer
+          (insert "@user\nMy draft: ")
+          (yank)
+          (gptel-ui-mode 1)
+          (should (equal (buffer-string) "@user\nMy draft: An answer"))
+          (should-not (get-text-property (1- (point-max)) 'gptel))
+          (should (= (length gptel-ui--turns) 1)))))))
+
+(ert-deftest gptel-ui-copy-omits-response-prefixes-but-keeps-literal-examples ()
+  (gptel-ui-test--buffer
+    (insert "@mayuri\n")
+    (insert (propertize "First answer.\n\n" 'gptel 'response))
+    (insert "@mayuri\n")
+    (insert (propertize "Second answer.\n\n```text\n@mayuri\n```\n"
+                        'gptel 'response))
+    (gptel-ui-mode 1)
+    (let ((text (buffer-string)))
+      (should (equal (filter-buffer-substring (point-max) (point-min))
+                     "First answer.\n\nSecond answer.\n\n```text\n@mayuri\n```\n"))
+      (should (equal-including-properties text (buffer-string))))))
+
+(ert-deftest gptel-ui-copy-inline-and-partial-prefix-preserves-body-markup ()
+  (gptel-ui-test--buffer
+    (let ((gptel-response-prefix-alist '((text-mode . "### "))))
+      (insert "### **Answer**")
+      (gptel-ui-mode 1)
+      (should (equal (filter-buffer-substring 2 (point-max)) "**Answer**"))
+      (should (equal (filter-buffer-substring 5 9) "**An")))))
+
+(ert-deftest gptel-ui-copy-preserves-source-and-cut-text ()
+  (gptel-ui-test--buffer
+    (insert "@mayuri\n")
+    (insert (propertize "Answer" 'gptel 'response))
+    (let ((text (buffer-string)))
+      (gptel-ui-mode 1)
+      (gptel-ui-toggle-source)
+      (should (equal-including-properties
+               text (filter-buffer-substring (point-min) (point-max))))
+      (gptel-ui-toggle-source)
+      (should (equal-including-properties
+               text (filter-buffer-substring (point-min) (point-max) t)))
+      (should (= (buffer-size) 0)))))
+
+(ert-deftest gptel-ui-copy-composes-with-an-existing-buffer-filter ()
+  (gptel-ui-test--buffer
+    (let ((filter (lambda (beg end delete)
+                    (upcase (buffer-substring--filter beg end delete)))))
+      (setq-local filter-buffer-substring-function filter)
+      (insert "@mayuri\nAnswer")
+      (gptel-ui-mode 1)
+      (should (equal (filter-buffer-substring (point-min) (point-max)) "ANSWER"))
+      (gptel-ui-mode -1)
+      (should (eq filter-buffer-substring-function filter))
+      (should (equal (filter-buffer-substring (point-min) (point-max))
+                     "@MAYURI\nANSWER")))))
+
+(ert-deftest gptel-ui-copy-filter-is-local-and-restored ()
+  (gptel-ui-test--buffer
+    (let ((local (local-variable-p 'filter-buffer-substring-function))
+          (filter filter-buffer-substring-function))
+      (insert "@mayuri\nAnswer")
+      (gptel-ui-mode 1)
+      (with-temp-buffer
+        (insert "@mayuri\nUnrelated")
+        (should (equal (filter-buffer-substring (point-min) (point-max))
+                       "@mayuri\nUnrelated")))
+      (gptel-ui-mode -1)
+      (should (eq (local-variable-p 'filter-buffer-substring-function) local))
+      (should (eq filter-buffer-substring-function filter)))))
 
 (ert-deftest gptel-ui-streaming-continuation-does-not-add-speaker ()
   (gptel-ui-test--buffer
