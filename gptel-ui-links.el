@@ -179,19 +179,36 @@ Point is initially just after the opening parenthesis."
     (setq target (substring target 0 -1)))
   target)
 
+(defun gptel-ui-links--overlap-p (begin end ranges)
+  "Whether BEGIN through END overlaps sorted disjoint RANGES.
+RANGES is a vector of half-open (START . END) intervals."
+  (let ((lo 0) (hi (length ranges)))
+    (while (< lo hi)
+      (let ((mid (/ (+ lo hi) 2)))
+        (if (<= (cdr (aref ranges mid)) begin)
+            (setq lo (1+ mid))
+          (setq hi mid))))
+    (and (< lo (length ranges)) (< (car (aref ranges lo)) end))))
+
 (defun gptel-ui-links-render (start end &optional skip-p)
   "Return link overlays for START through END without changing text.
 SKIP-P, when non-nil, receives candidate start and end positions; a
 non-nil result excludes the link.  The caller owns the returned overlays."
   (save-excursion
-    (let (overlays)
+    (let (overlays ranges pending (index []))
       (cl-labels
-          ((covered (begin finish)
+          ;; Each grammar pass visits nonoverlapping candidates in source
+          ;; order.  Only earlier, higher-precedence passes need indexing.
+          ;; Merge once per pass, rather than walking every accepted overlay
+          ;; for every candidate (quadratic even for ordinary bare URLs).
+          ((next-pass ()
+             (setq ranges (cl-merge 'list ranges (nreverse pending)
+                                    #'< :key #'car)
+                   pending nil
+                   index (vconcat ranges)))
+           (covered (begin finish)
              (or (and skip-p (funcall skip-p begin finish))
-                 (cl-some (lambda (ov)
-                            (and (< begin (overlay-end ov))
-                                 (> finish (overlay-start ov))))
-                          overlays)))
+                 (gptel-ui-links--overlap-p begin finish index)))
            (add-link (begin finish target &optional label existing-only)
              (unless (covered begin finish)
                (let* ((destination (gptel-ui-links--destination target))
@@ -214,6 +231,7 @@ non-nil result excludes the link.  The caller owns the returned overlays."
                      (when label
                        (overlay-put ov 'display
                                     (gptel-ui-links-string label target)))
+                     (push (cons begin finish) pending)
                      (push ov overlays)))))))
         ;; Org links first so their nested brackets cannot become Markdown links.
         (goto-char start)
@@ -223,6 +241,7 @@ non-nil result excludes the link.  The caller owns the returned overlays."
                     (match-string-no-properties 1)
                     (or (match-string-no-properties 2)
                         (match-string-no-properties 1))))
+        (next-pass)
         (goto-char start)
         (while (re-search-forward "\\[\\([^]\n]+\\)\\](" end t)
           (let ((begin (match-beginning 0))
@@ -238,17 +257,20 @@ non-nil result excludes the link.  The caller owns the returned overlays."
         ;; Markdown and Org code-quoted paths, including slashless names.
         (dolist (pattern '("`\\([^`\n]+\\)`" "=\\([^=\n]+\\)="
                            "~\\([^~\n]+\\)~"))
+          (next-pass)
           (goto-char start)
           (while (re-search-forward pattern end t)
             (let ((begin (match-beginning 0)) (finish (match-end 0))
                   (target (match-string-no-properties 1)))
               (add-link begin finish target target t))))
+        (next-pass)
         (goto-char start)
         (while (re-search-forward "https?://[^[:space:]<>\"'`]+" end t)
           (let* ((begin (match-beginning 0))
                  (target (gptel-ui-links--trim-bare
                           (match-string-no-properties 0))))
             (add-link begin (+ begin (length target)) target)))
+        (next-pass)
         (goto-char start)
         (while (re-search-forward
                 "\\(?:^\\|[[:space:](]\\)\\(\\(?:/\\|~/\\)[^[:space:]<>\"'`]+\\)" end t)

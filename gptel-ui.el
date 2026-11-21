@@ -93,6 +93,10 @@ after changing this option."
 (declare-function gptel-highlight-mode "gptel" (&optional arg))
 
 (defvar-local gptel-ui--overlays nil)
+(defvar-local gptel-ui--link-cache nil
+  "Last link render's modification tick, directory and excluded ranges.")
+(defvar-local gptel-ui--link-dirty-start nil
+  "Earliest complete source line needing link rendering, or nil.")
 (defvar-local gptel-ui--timer nil)
 (defvar-local gptel-ui--saved nil)
 (defvar-local gptel-ui--face-cookie nil)
@@ -127,11 +131,25 @@ after changing this option."
     (push ov gptel-ui--overlays)
     ov))
 
-(defun gptel-ui--clear ()
-  "Remove only overlays owned by this mode."
-  (mapc #'delete-overlay gptel-ui--overlays)
-  (setq gptel-ui--overlays nil
-        gptel-ui--turns nil
+(defun gptel-ui--clear (&optional keep-links)
+  "Remove only overlays owned by this mode, optionally KEEP-LINKS."
+  (setq gptel-ui--overlays
+        (cl-delete-if-not
+         (lambda (ov)
+           (if (and keep-links (overlay-buffer ov)
+                    (overlay-get ov 'gptel-ui-links))
+               (progn
+                 ;; Tool response spacing is recomputed on every refresh.
+                 (when (overlay-get ov 'gptel-ui-tool-gap)
+                   (overlay-put ov 'before-string nil)
+                   (overlay-put ov 'gptel-ui-tool-gap nil))
+                 t)
+             (delete-overlay ov)
+             nil))
+         gptel-ui--overlays))
+  (unless keep-links
+    (setq gptel-ui--link-cache nil gptel-ui--link-dirty-start nil))
+  (setq gptel-ui--turns nil
         gptel-ui--tool-starts nil
         gptel-ui--tool-response-starts nil
         gptel-ui--excluded nil
@@ -582,9 +600,73 @@ transcript and ordinary markup remain untouched."
       (unless (equal (window-margins window) (cons margin margin))
         (set-window-margins window margin margin)))))
 
+(defun gptel-ui--link-exclusions ()
+  "Snapshot structural and role ranges which exclude links."
+  (let ((ranges (copy-sequence gptel-ui--excluded)) (pos (point-min)))
+    (while (< pos (point-max))
+      (let ((next (next-single-property-change pos 'gptel nil (point-max)))
+            (role (get-text-property pos 'gptel)))
+        (when (and role (not (eq role 'response)))
+          (push (cons pos next) ranges))
+        (setq pos next)))
+    (sort ranges (lambda (a b) (if (= (car a) (car b))
+                                 (< (cdr a) (cdr b))
+                               (< (car a) (car b)))))))
+
+(defun gptel-ui--link-prefix-ranges (ranges end)
+  "Return the portion of sorted RANGES before END."
+  (cl-loop for (beg . finish) in ranges
+           while (< beg end) collect (cons beg (min finish end))))
+
+(defun gptel-ui--links (&optional force)
+  "Refresh links in the changed suffix, or all links when FORCE is non-nil.
+Structural renderers still run in full: fences, tables and role restoration
+can change link eligibility outside the edited lines.  Reuse the untouched
+prefix only when its exclusions and workspace are unchanged."
+  (let* ((ranges (gptel-ui--link-exclusions))
+         (tick (buffer-modified-tick))
+         (start (cond
+                 ((or force (null gptel-ui--link-cache)
+                      (not (equal default-directory (nth 1 gptel-ui--link-cache))))
+                  (point-min))
+                 (gptel-ui--link-dirty-start)
+                 ;; Silent property restoration bypasses after-change hooks.
+                 ((/= tick (car gptel-ui--link-cache)) (point-min))
+                 (t (point-max)))))
+    (unless (equal (gptel-ui--link-prefix-ranges ranges start)
+                   (gptel-ui--link-prefix-ranges
+                    (nth 2 gptel-ui--link-cache) start))
+      (setq start (point-min)))
+    (setq gptel-ui--overlays
+          (cl-delete-if
+           (lambda (ov)
+             (when (and (overlay-get ov 'gptel-ui-links)
+                        (>= (overlay-start ov) start))
+               (delete-overlay ov)
+               t))
+           gptel-ui--overlays))
+    (when (< start (point-max))
+      (setq gptel-ui--overlays
+            (nconc (gptel-ui-links-render start (point-max) #'gptel-ui--skip-p)
+                   gptel-ui--overlays)))
+    (setq gptel-ui--link-cache (list tick default-directory ranges)
+          gptel-ui--link-dirty-start nil)))
+
+(defun gptel-ui--link-change-start (beg)
+  "Return the start of the complete link source line containing BEG.
+Include preceding lines continued by a backslash in a Markdown destination."
+  (save-excursion
+    (goto-char beg)
+    (beginning-of-line)
+    (while (and (> (point) (point-min))
+                (eq (char-before (1- (point))) ?\\))
+      (forward-line -1))
+    (point)))
+
 ;;;###autoload
 (defun gptel-ui-refresh (&rest _)
-  "Refresh the current chat's display without modifying its transcript."
+  "Refresh the current chat's display without modifying its transcript.
+Interactively, also recheck unchanged links for local file availability."
   (interactive)
   (when gptel-ui-mode
     (when (timerp gptel-ui--timer) (cancel-timer gptel-ui--timer))
@@ -592,7 +674,7 @@ transcript and ordinary markup remain untouched."
     (save-excursion
       (save-restriction
         (widen)
-        (gptel-ui--clear)
+        (gptel-ui--clear (not gptel-ui--source))
         (gptel-ui--margins)
         (unless gptel-ui--source
           (gptel-ui--blocks)
@@ -604,15 +686,20 @@ transcript and ordinary markup remain untouched."
             (dolist (ov tables)
               (push (cons (overlay-start ov) (overlay-end ov)) gptel-ui--excluded))
             (setq gptel-ui--overlays (nconc tables gptel-ui--overlays)))
-          (setq gptel-ui--overlays
-                (nconc (gptel-ui-links-render
-                        (point-min) (point-max) #'gptel-ui--skip-p)
-                       gptel-ui--overlays))
+          (gptel-ui--links (called-interactively-p 'interactive))
           (gptel-ui--tool-response-spacing)
           (setq gptel-ui--turns (sort (delete-dups gptel-ui--turns) #'<)))))))
 
-(defun gptel-ui--schedule (&rest _)
-  "Coalesce streaming and editing changes into one display refresh."
+(defun gptel-ui--schedule (&optional beg end old-length)
+  "Coalesce streaming and editing changes into one display refresh.
+BEG, END and OLD-LENGTH identify an `after-change-functions' notification."
+  (when (and gptel-ui-mode (integerp beg) (integerp end) (integerp old-length))
+    (save-match-data
+      (save-restriction
+        (widen)
+        (let ((start (gptel-ui--link-change-start beg)))
+          (setq gptel-ui--link-dirty-start
+                (min start (or gptel-ui--link-dirty-start start)))))))
   (when (and gptel-ui-mode (not (timerp gptel-ui--timer)))
     (setq gptel-ui--timer
           (run-at-time gptel-ui-refresh-delay nil
