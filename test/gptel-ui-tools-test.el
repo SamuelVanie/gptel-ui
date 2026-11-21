@@ -9,6 +9,8 @@
 (require 'org)
 (require 'gptel-ui-tools)
 
+(defvar gptel-tool-call-actions-map)
+
 (defun gptel-ui-tools-test--insert (&optional incomplete)
   "Insert a native Org tool result, returning renderer arguments.
 INCOMPLETE omits the closing fence."
@@ -130,6 +132,152 @@ INCOMPLETE omits the closing fence."
       (setq-local buffer-invisibility-spec t)
       (apply #'gptel-ui-tools-render-block arguments)
       (should-not (invisible-p (point-min))))))
+
+(defun gptel-ui-tools-test--approval (buffer start end &optional prompt-start)
+  "Create a fake native approval in BUFFER from START to END.
+When non-nil, PROMPT-START marks the visible prompt within the dispatch area."
+  (with-current-buffer buffer
+    (let ((overlay (make-overlay start end)))
+      (overlay-put overlay 'gptel-tool '(pending))
+      (overlay-put overlay 'keymap gptel-tool-call-actions-map)
+      (when prompt-start
+        (overlay-put overlay 'prompt (list (make-overlay prompt-start end))))
+      overlay)))
+
+(ert-deftest gptel-ui-tools-find-hidden-and-narrowed-approvals-only ()
+  (let ((gptel-tool-call-actions-map (make-sparse-keymap))
+        (first (generate-new-buffer " *ui-approval-a*"))
+        (second (generate-new-buffer " *ui-approval-b*")))
+    (unwind-protect
+        (let (early late other)
+          (with-current-buffer first
+            (insert (make-string 100 ?x))
+            (setq late (gptel-ui-tools-test--approval first 60 90 75)
+                  early (gptel-ui-tools-test--approval first 10 40 25))
+            (let ((inspection (make-overlay 45 55)))
+              (overlay-put inspection 'gptel-tool '(inspection-copy)))
+            (let ((stale (gptel-ui-tools-test--approval first 91 99)))
+              (delete-overlay stale))
+            (narrow-to-region 41 59))
+          (with-current-buffer second
+            (insert "pending")
+            (setq other (gptel-ui-tools-test--approval second 1 (point-max))))
+          (should (equal (gptel-ui-tools-pending-approvals)
+                         (list early late other)))
+          ;; Reading the queue must preserve the buffer's restriction.
+          (with-current-buffer first
+            (should (= (point-min) 41))
+            (should (= (point-max) 59))))
+      (kill-buffer first)
+      (kill-buffer second))))
+
+(ert-deftest gptel-ui-tools-cycle-prompts-across-buffers-and-wrap ()
+  (let ((gptel-tool-call-actions-map (make-sparse-keymap))
+        (first (generate-new-buffer " *ui-approval-a*"))
+        (second (generate-new-buffer " *ui-approval-b*")))
+    (unwind-protect
+        (save-window-excursion
+          (let (early late other)
+            (with-current-buffer first
+              (insert (make-string 100 ?x))
+              (setq early (gptel-ui-tools-test--approval first 10 40 25)
+                    late (gptel-ui-tools-test--approval first 50 90 75)))
+            (with-current-buffer second
+              (insert "pending")
+              (setq other (gptel-ui-tools-test--approval second 1 (point-max))))
+            ;; Avoid installing an interactive transient map in this unit test.
+            (cl-letf (((symbol-function 'set-transient-map) #'ignore))
+              (switch-to-buffer first)
+              (goto-char 1)
+              (should (eq (gptel-ui-next-approval) early))
+              (should (= (point) 25))
+              (should (eq (gptel-ui-next-approval) late))
+              (should (= (point) 75))
+              (should (eq (gptel-ui-next-approval) other))
+              (should (eq (current-buffer) second))
+              (should (eq (gptel-ui-next-approval) early))
+              (should (eq (gptel-ui-previous-approval) other))
+              (delete-overlay late)
+              (should (eq (gptel-ui-previous-approval) early))
+              (delete-overlay other)
+              (should (eq (gptel-ui-next-approval) early))
+              (delete-overlay early)
+              (should-error (gptel-ui-next-approval) :type 'user-error))))
+      (kill-buffer first)
+      (kill-buffer second))))
+
+(ert-deftest gptel-ui-tools-navigation-reveals-narrowed-native-prompt ()
+  (let ((gptel-tool-call-actions-map (make-sparse-keymap))
+        (buffer (generate-new-buffer " *ui-approval-native*")))
+    (define-key gptel-tool-call-actions-map (kbd "C-c C-c") #'ignore)
+    (define-key gptel-tool-call-actions-map (kbd "C-c C-k") #'ignore)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert (make-string 100 ?x))
+          (let ((approval (gptel-ui-tools-test--approval buffer 10 90 75))
+                (text (buffer-string))
+                transient-map keep-predicate)
+            (narrow-to-region 1 9)
+            (cl-letf (((symbol-function 'set-transient-map)
+                       (lambda (map predicate &rest _)
+                         (setq transient-map map keep-predicate predicate))))
+              (should (eq (gptel-ui-next-approval) approval)))
+            (should (= (point) 75))
+            (should-not (buffer-narrowed-p))
+            (should (equal-including-properties text (buffer-string)))
+            (should (eq (overlay-get approval 'keymap) gptel-tool-call-actions-map))
+            ;; The temporary map must let the original approval shortcuts run.
+            (let ((overriding-terminal-local-map transient-map))
+              (should (eq (key-binding (kbd "C-c ]")) #'gptel-ui-next-approval))
+              (should (eq (key-binding (kbd "C-c [")) #'gptel-ui-previous-approval))
+              (should (eq (key-binding (kbd "C-c C-c")) #'ignore))
+              (should (eq (key-binding (kbd "C-c C-k")) #'ignore)))
+            (let ((this-command 'gptel--accept-tool-calls))
+              (should (funcall keep-predicate)))
+            (let ((this-command 'forward-char))
+              (should-not (funcall keep-predicate)))))
+      (kill-buffer buffer))))
+
+(ert-deftest gptel-ui-tools-zero-width-preview-keeps-native-keys-active ()
+  (let ((gptel-tool-call-actions-map (make-sparse-keymap)))
+    (with-temp-buffer
+      (insert "response")
+      (let ((approval (gptel-ui-tools-test--approval
+                       (current-buffer) 1 (point-max) (point-max))))
+        (should (= (gptel-ui-tools--approval-position approval) (1- (point-max))))
+        (should (eq (get-char-property (gptel-ui-tools--approval-position approval)
+                                       'keymap)
+                    gptel-tool-call-actions-map))))))
+
+(ert-deftest gptel-ui-tools-transient-navigation-does-not-stack-or-shadow-actions ()
+  (let ((gptel-tool-call-actions-map (make-sparse-keymap))
+        (buffer (generate-new-buffer " *ui-approval-transient*"))
+        (overriding-terminal-local-map nil)
+        (pre-command-hook nil)
+        (original-set-transient-map (symbol-function 'set-transient-map))
+        (install-count 0)
+        exit-function)
+    (define-key gptel-tool-call-actions-map (kbd "C-c C-c") #'ignore)
+    (define-key gptel-tool-call-actions-map (kbd "C-c C-k") #'ignore)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (insert "response\npending\n")
+          (gptel-ui-tools-test--approval buffer 1 (point-max) 10)
+          (cl-letf (((symbol-function 'set-transient-map)
+                     (lambda (&rest arguments)
+                       (cl-incf install-count)
+                       (setq exit-function (apply original-set-transient-map arguments)))))
+            (gptel-ui-next-approval)
+            (gptel-ui-next-approval)
+            (gptel-ui-previous-approval)
+            (should (= install-count 1))
+            (should (eq (key-binding (kbd "C-c ]")) #'gptel-ui-next-approval))
+            (should (eq (key-binding (kbd "C-c C-c")) #'ignore))
+            (should (eq (key-binding (kbd "C-c C-k")) #'ignore))))
+      (when exit-function (funcall exit-function))
+      (kill-buffer buffer))))
 
 (provide 'gptel-ui-tools-test)
 ;;; gptel-ui-tools-test.el ends here

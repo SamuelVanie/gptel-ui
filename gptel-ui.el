@@ -38,6 +38,13 @@
   "Fallback name for responses without a named response prefix."
   :type 'string :group 'gptel-ui)
 
+(defcustom gptel-ui-header-details nil
+  "Whether to retain gptel's backend, model and prompt header controls.
+The compact header always retains the native request status and highlights
+pending tool approvals across conversations.  Re-enable `gptel-ui-mode'
+after changing this option."
+  :type 'boolean :group 'gptel-ui)
+
 (defface gptel-ui-user
   '((t (:inherit font-lock-keyword-face :weight bold :height 0.95)))
   "Speaker label for the user's messages." :group 'gptel-ui)
@@ -73,6 +80,9 @@
 (defface gptel-ui-quote
   '((t (:inherit font-lock-doc-face :slant italic)))
   "Quoted prose." :group 'gptel-ui)
+(defface gptel-ui-approval
+  '((t (:inherit warning :weight bold)))
+  "Pending tool approvals in the conversation header." :group 'gptel-ui)
 
 (defvar gptel-mode)
 (defvar gptel-model)
@@ -96,6 +106,16 @@
 (defvar-local gptel-ui--tool-starts nil)
 (defvar-local gptel-ui--tool-response-starts nil)
 (defvar-local gptel-ui--highlight-was-on nil)
+(defvar-local gptel-ui--native-header nil)
+(defvar-local gptel-ui--installed-header nil)
+(defvar gptel-ui--approval-cache nil)
+(defvar gptel-ui--approval-cache-dirty t)
+(defvar gptel-ui--watching-approvals nil)
+
+(defconst gptel-ui--approval-functions
+  '(gptel--display-tool-calls gptel--accept-tool-calls
+    gptel--reject-tool-calls gptel--steer-tool-calls)
+  "Native operations that change pending approval prompts.")
 
 (defun gptel-ui--overlay (beg end &rest properties)
   "Create an owned overlay from BEG to END with PROPERTIES."
@@ -221,7 +241,9 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
                               'face face)))
     (push beg gptel-ui--turns)
     (if prefix
-        (gptel-ui--overlay beg end 'display caption 'priority 30)
+        (gptel-ui--overlay beg end 'display caption 'priority 30
+                           'gptel-ui-copy-prefix assistant
+                           'gptel-ui-copy-newline (eq (char-after end) ?\n))
       (if-let* ((opening (cl-find-if
                           (lambda (ov) (or (overlay-get ov 'gptel-ui-code-opening)
                                            (overlay-get ov 'gptel-ui-block-opening)))
@@ -304,7 +326,8 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
           (when (eq kind 'assistant-prefix)
             (gptel-ui--overlay
              beg (if (and (car rest) (< end (point-max))) (1+ end) end)
-             'display "" 'priority 30 'gptel-ui-continuation t)))
+             'display "" 'priority 30 'gptel-ui-continuation t
+             'gptel-ui-copy-prefix t)))
          (t
           (setq assistant-active t)
           (gptel-ui--speaker beg end name t (eq kind 'assistant-prefix))
@@ -314,6 +337,38 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
           (push beg gptel-ui--tool-response-starts)
           (setq tool-pending nil))
         (when (eq kind 'tool) (setq tool-pending t))))))
+
+(defun gptel-ui--filter-copy (function beg end delete)
+  "Copy BEG through END using FUNCTION without assistant markers.
+Keep native filtering, source view, and DELETE operations intact.  Only
+rendered response prefixes and copied role metadata are omitted; the
+transcript and ordinary markup remain untouched."
+  (if (or (not gptel-ui-mode) gptel-ui--source delete)
+      (funcall function beg end delete)
+    (let ((start (min beg end)) (limit (max beg end)) ranges pieces)
+      (dolist (ov gptel-ui--overlays)
+        (when (and (overlay-buffer ov) (overlay-get ov 'gptel-ui-copy-prefix))
+          (let ((from (max start (overlay-start ov)))
+                (to (min limit (+ (overlay-end ov)
+                                  (if (overlay-get ov 'gptel-ui-copy-newline) 1 0)))))
+            (when (< from to) (push (cons from to) ranges)))))
+      (dolist (range (sort ranges (lambda (a b) (< (car a) (car b)))))
+        (when (< start (car range))
+          (push (funcall function start (car range) nil) pieces))
+        (setq start (max start (cdr range))))
+      (when (< start limit)
+        (push (funcall function start limit nil) pieces))
+      (let ((text (apply #'concat (nreverse pieces))) (pos 0))
+        ;; A pasted response property makes an ordinary draft look like a
+        ;; new assistant response, even when no literal prefix was copied.
+        (remove-list-of-text-properties 0 (length text) '(gptel) text)
+        (while (< pos (length text))
+          (let ((next (next-single-property-change pos 'front-sticky text (length text)))
+                (sticky (get-text-property pos 'front-sticky text)))
+            (when (and (listp sticky) (memq 'gptel sticky))
+              (put-text-property pos next 'front-sticky (remq 'gptel sticky) text))
+            (setq pos next)))
+        text))))
 
 (defun gptel-ui--tool-response-spacing ()
   "Add two display-only blank lines before prose following tool activity."
@@ -418,17 +473,105 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
             (overlay-put ov 'display (propertize caption 'face 'gptel-ui-report)))
           (push (cons beg end) gptel-ui--excluded))))))
 
+(defun gptel-ui--approvals-changed (&rest _)
+  "Refresh approval indicators in every conversation on the next redisplay."
+  (setq gptel-ui--approval-cache-dirty t)
+  (force-mode-line-update t))
+
+(defun gptel-ui--watch-approvals ()
+  "Observe native approval changes while conversation headers are visible."
+  (unless gptel-ui--watching-approvals
+    (dolist (function gptel-ui--approval-functions)
+      (advice-add function :after #'gptel-ui--approvals-changed))
+    (add-hook 'kill-buffer-hook #'gptel-ui--approvals-changed)
+    (setq gptel-ui--watching-approvals t))
+  (gptel-ui--approvals-changed))
+
+(defun gptel-ui--unwatch-approvals ()
+  "Stop observing approvals when the last conversation view closes."
+  (dolist (function gptel-ui--approval-functions)
+    (advice-remove function #'gptel-ui--approvals-changed))
+  (remove-hook 'kill-buffer-hook #'gptel-ui--approvals-changed)
+  (setq gptel-ui--watching-approvals nil
+        gptel-ui--approval-cache nil
+        gptel-ui--approval-cache-dirty t))
+
+(defun gptel-ui--header-next-approval (event)
+  "Visit the next pending approval from the header clicked by EVENT."
+  (interactive "e")
+  (let ((window (posn-window (event-start event))))
+    (when (window-live-p window) (select-window window)))
+  (gptel-ui-next-approval))
+
+(defvar gptel-ui--approval-header-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [header-line mouse-1] #'gptel-ui--header-next-approval)
+    (define-key map [mouse-1] #'gptel-ui--header-next-approval)
+    map)
+  "Navigation from the pending-approval indicator.")
+
+(defun gptel-ui--approval-header ()
+  "Return a clickable indicator for pending approvals in any conversation."
+  (when gptel-ui--approval-cache-dirty
+    (setq gptel-ui--approval-cache (gptel-ui-tools-pending-approvals)
+          gptel-ui--approval-cache-dirty nil))
+  ;; Buffer deletion and cancellation can remove overlays outside native
+  ;; approval commands.  Never keep a dead prompt visible in the header.
+  (setq gptel-ui--approval-cache
+        (cl-remove-if-not #'overlay-buffer gptel-ui--approval-cache))
+  (when gptel-ui--approval-cache
+    (let* ((count (length gptel-ui--approval-cache))
+           (buffers (delete-dups
+                     (mapcar (lambda (ov) (buffer-name (overlay-buffer ov)))
+                             gptel-ui--approval-cache))))
+      (propertize
+       (format "  ! %d approval%s  " count (if (= count 1) "" "s"))
+       'face 'gptel-ui-approval 'mouse-face 'highlight
+       'local-map gptel-ui--approval-header-map
+       'help-echo
+       (concat "Pending tool approvals: " (string-join buffers ", ")
+               "\nClick to visit the next approval, or "
+               (substitute-command-keys "\\[gptel-ui-next-approval]"))))))
+
 (defun gptel-ui--header ()
-  "Return the small conversation identity header."
-  (concat (propertize "  ◉  CHAT" 'face 'gptel-ui-assistant)
+  "Return a compact conversation header, with approvals before other details."
+  (concat (gptel-ui--approval-header)
+          (propertize "  ◉  CHAT" 'face 'gptel-ui-assistant)
           (propertize (concat "    " (file-name-nondirectory (directory-file-name default-directory)))
                       'face 'gptel-ui-muted)
-          (when (and (boundp 'gptel-model) (not (bound-and-true-p gptel-use-header-line)))
-            (propertize (format "   /   %s" gptel-model) 'face 'gptel-ui-muted))
           (propertize (cond (gptel-ui--source "   SOURCE")
                             ((bound-and-true-p gptel-use-header-line) "")
                             (t "     C-c C-v  source")) 'face 'gptel-ui-muted)
           "  "))
+
+(defun gptel-ui--setup-header ()
+  "Install a compact header while preserving native status updates."
+  (setq gptel-ui--native-header
+        (and (bound-and-true-p gptel-mode)
+             (bound-and-true-p gptel-use-header-line)
+             (consp header-line-format)
+             header-line-format))
+  (setq-local header-line-format
+              (if gptel-ui--native-header
+                  ;; Native gptel updates slot 1 in place.  The remaining
+                  ;; controls stay in the saved header for exact restoration.
+                  (append (list (if gptel-ui-header-details
+                                    (list '(:eval (gptel-ui--header))
+                                          (car gptel-ui--native-header))
+                                  '(:eval (gptel-ui--header)))
+                                (nth 1 gptel-ui--native-header))
+                          (when gptel-ui-header-details
+                            (nthcdr 2 gptel-ui--native-header)))
+                (list '(:eval (gptel-ui--header)) header-line-format)))
+  (setq gptel-ui--installed-header header-line-format)
+  (gptel-ui--watch-approvals))
+
+(defun gptel-ui--restore-header-status ()
+  "Keep the latest native request status when restoring the original header."
+  (when (and gptel-ui--native-header
+             (eq header-line-format gptel-ui--installed-header))
+    (setf (nth 1 gptel-ui--native-header) (nth 1 header-line-format)))
+  (setq gptel-ui--native-header nil gptel-ui--installed-header nil))
 
 (defun gptel-ui--margins ()
   "Give every window displaying the current buffer a comfortable measure."
@@ -510,6 +653,8 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
     (define-key map (kbd "C-c C-v") #'gptel-ui-toggle-source)
     (define-key map (kbd "C-c C-n") #'gptel-ui-next-turn)
     (define-key map (kbd "C-c C-p") #'gptel-ui-previous-turn)
+    (define-key map (kbd "C-c ]") #'gptel-ui-next-approval)
+    (define-key map (kbd "C-c [") #'gptel-ui-previous-approval)
     (define-key map (kbd "C-c C-o") #'gptel-ui-links-open)
     map))
 
@@ -522,6 +667,7 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
                      (and (not (eq buffer (current-buffer)))
                           (buffer-local-value 'gptel-ui-mode buffer)))
                    (buffer-list))
+    (gptel-ui--unwatch-approvals)
     (remove-hook 'window-size-change-functions #'gptel-ui--window-change)
     (remove-hook 'window-configuration-change-hook #'gptel-ui--window-change)))
 
@@ -534,23 +680,17 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
   (if gptel-ui-mode
       (unless gptel-ui--saved
         (dolist (var '(line-spacing word-wrap truncate-lines header-line-format
+                                    filter-buffer-substring-function
                                     display-line-numbers))
           (push (list var (local-variable-p var) (symbol-value var)) gptel-ui--saved))
         (setq-local line-spacing 0.22 word-wrap t truncate-lines nil display-line-numbers nil)
-        (setq-local header-line-format
-                    (if (and (bound-and-true-p gptel-mode)
-                             (bound-and-true-p gptel-use-header-line)
-                             (consp header-line-format))
-                        ;; gptel updates slot 1 in place.  Keep that tail shared
-                        ;; with the saved header so status and controls survive.
-                        (cons (list '(:eval (gptel-ui--header))
-                                    (car header-line-format))
-                              (cdr header-line-format))
-                      (list '(:eval (gptel-ui--header)) header-line-format)))
+        (gptel-ui--setup-header)
         (setq gptel-ui--face-cookie
               (face-remap-add-relative 'default '(:weight normal :slant normal) 'variable-pitch))
         (setq gptel-ui--highlight-was-on (bound-and-true-p gptel-highlight-mode))
         (when gptel-ui--highlight-was-on (gptel-highlight-mode -1))
+        (add-function :around (local 'filter-buffer-substring-function)
+                      #'gptel-ui--filter-copy)
         (add-hook 'after-change-functions #'gptel-ui--schedule nil t)
         (add-hook 'gptel-post-stream-hook #'gptel-ui--schedule nil t)
         (add-hook 'gptel-post-response-functions #'gptel-ui--schedule nil t)
@@ -561,7 +701,9 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
         (gptel-ui-refresh)
         ;; Restored chats receive role properties after gptel-mode-hook.
         (gptel-ui--schedule))
+    (gptel-ui--restore-header-status)
     (gptel-ui--cleanup)
+    (remove-function (local 'filter-buffer-substring-function) #'gptel-ui--filter-copy)
     (remove-hook 'after-change-functions #'gptel-ui--schedule t)
     (remove-hook 'gptel-post-stream-hook #'gptel-ui--schedule t)
     (remove-hook 'gptel-post-response-functions #'gptel-ui--schedule t)
