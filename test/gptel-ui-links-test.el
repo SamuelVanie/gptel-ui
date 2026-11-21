@@ -187,5 +187,99 @@
       (overlay-put overlay 'display "ordinary text")
       (should-error (gptel-ui-links-open) :type 'user-error))))
 
+(ert-deftest gptel-ui-links-overlap-index-obeys-half-open-boundaries ()
+  ;; Compare every nonempty query with the simple definition, including
+  ;; adjacency, containment, partial overlap, and spans across several ranges.
+  (dolist (ranges '([] [(2 . 4)] [(2 . 4) (6 . 8) (8 . 10)]))
+    (dotimes (begin 12)
+      (cl-loop for end from (1+ begin) to 13 do
+               (should
+                (eq (and (gptel-ui-links--overlap-p begin end ranges) t)
+                    (and (cl-some (lambda (range)
+                                    (and (< begin (cdr range))
+                                         (> end (car range))))
+                                  ranges)
+                         t)))))))
+
+(ert-deftest gptel-ui-links-precedence-excludes-nested-and-partial-overlap ()
+  (with-temp-buffer
+    (insert "[outer](https://markdown.test/[[https://org.test]])\n"
+            "[[https://adjacent.test]][md](target.el)\n"
+            "https://partial.test/[md](target.el)\n"
+            "`[code](target.el)`\n")
+    ;; Make the code-quoted candidate eligible too: its Markdown link wins
+    ;; because Markdown is a higher-precedence grammar pass.
+    (cl-letf (((symbol-function 'gptel-ui-links--resolve) #'identity)
+              ((symbol-function 'file-exists-p) (lambda (_) t)))
+      (let ((overlays (gptel-ui-links-render (point-min) (point-max))))
+        (should
+         (equal (mapcar (lambda (ov)
+                          (buffer-substring-no-properties
+                           (overlay-start ov) (overlay-end ov)))
+                        overlays)
+                '("[[https://org.test]]"
+                  "[[https://adjacent.test]]" "[md](target.el)"
+                  "[md](target.el)" "[code](target.el)")))
+        ;; Touching links coexist; a lower-precedence candidate that extends
+        ;; beyond an existing link is excluded in its entirety.
+        (should (= (overlay-end (nth 1 overlays))
+                   (overlay-start (nth 2 overlays))))))))
+
+(ert-deftest gptel-ui-links-rejected-candidates-do-not-reserve-ranges ()
+  (with-temp-buffer
+    (insert "[https://markdown-fallback.test ](javascript:bad)\n"
+            "[[javascript:bad][https://org-fallback.test]]\n"
+            "[skip](https://skip-fallback.test)\n")
+    (let ((overlays
+           (gptel-ui-links-render
+            (point-min) (point-max)
+            (lambda (begin _end)
+              ;; Reject the enclosing Markdown candidate, but allow its URL.
+              (save-excursion
+                (goto-char begin)
+                (looking-at-p "\\[skip\\]"))))))
+      (should
+       (equal (mapcar (lambda (ov) (overlay-get ov 'gptel-ui-link)) overlays)
+              '("https://markdown-fallback.test"
+                "https://org-fallback.test" "https://skip-fallback.test")))
+      (should-not (cl-some (lambda (ov) (overlay-get ov 'display)) overlays)))))
+
+(ert-deftest gptel-ui-links-overlap-work-scales-subquadratically ()
+  ;; Count operations rather than elapsed time.  The old overlap scan reads
+  ;; every earlier overlay's endpoint and quadruples its work when doubled.
+  ;; Fixed grammar passes and indexed overlap checks grow at most N log N.
+  (cl-labels
+      ((measure (count)
+         (with-temp-buffer
+           (dotimes (index count)
+             (insert (format "[[https://org.test/%d]] [md](https://md.test/%d)\n"
+                             index index)))
+           (let ((endpoint (symbol-function 'overlay-end))
+                 (query (symbol-function 'gptel-ui-links--overlap-p))
+                 (element (symbol-function 'aref)) (reads 0))
+             (cl-letf (((symbol-function 'overlay-end)
+                        (lambda (overlay)
+                          (cl-incf reads)
+                          (funcall endpoint overlay)))
+                       ((symbol-function 'gptel-ui-links--overlap-p)
+                        (lambda (begin end ranges)
+                          ;; Count queries even when byte compilation has
+                          ;; inlined the primitive vector reads below.
+                          (cl-incf reads)
+                          (funcall query begin end ranges)))
+                       ((symbol-function 'aref)
+                        (lambda (array index)
+                          ;; Strings are parsed separately; vector reads
+                          ;; measure the indexed interval queries.
+                          (when (vectorp array) (cl-incf reads))
+                          (funcall element array index))))
+               (should (= (* 2 count)
+                          (length (gptel-ui-links-render (point-min) (point-max))))))
+             reads))))
+    (let ((small (measure 64)) (large (measure 128)))
+      (should (> small 0))
+      (should (< large (* 3 small)))
+      (should (< large (* 128 80))))))
+
 (provide 'gptel-ui-links-test)
 ;;; gptel-ui-links-test.el ends here
