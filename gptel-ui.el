@@ -175,7 +175,13 @@ after changing this option."
 
 (defun gptel-ui--skip-p (beg end)
   "Whether BEG through END overlaps code or native tool content."
-  (or (let ((pos beg) found)
+  (or (cl-some (lambda (ov)
+                 (and (overlay-get ov 'gptel-tool)
+                      (< (overlay-start ov) (overlay-end ov))
+                      (< (overlay-start ov) end)
+                      (> (overlay-end ov) beg)))
+               (overlays-in beg end))
+      (let ((pos beg) found)
         (while (and (< pos end) (not found))
           (let ((role (get-text-property pos 'gptel)))
             (setq found (and role (not (eq role 'response)))))
@@ -604,8 +610,14 @@ transcript and ordinary markup remain untouched."
         (set-window-margins window margin margin)))))
 
 (defun gptel-ui--link-exclusions ()
-  "Snapshot structural and role ranges which exclude links."
+  "Snapshot structural, role and pending approval ranges excluding links."
   (let ((ranges (copy-sequence gptel-ui--excluded)) (pos (point-min)))
+    ;; Approval overlays can change without changing the modification tick.
+    ;; Keep them out of the disjoint structural index: they can enclose blocks.
+    (dolist (ov (overlays-in (point-min) (point-max)))
+      (when (and (overlay-get ov 'gptel-tool)
+                 (< (overlay-start ov) (overlay-end ov)))
+        (push (cons (overlay-start ov) (overlay-end ov)) ranges)))
     (while (< pos (point-max))
       (let ((next (next-single-property-change pos 'gptel nil (point-max)))
             (role (get-text-property pos 'gptel)))
