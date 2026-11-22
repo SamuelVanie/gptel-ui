@@ -253,6 +253,46 @@
         (should (cl-some (lambda (ov) (overlay-get ov 'gptel-ui-table))
                         gptel-ui--overlays))))))
 
+(ert-deftest gptel-ui-render-approval-change-schedules-only-affected-buffer ()
+  (gptel-ui-render-test--buffer
+    (insert "https://example.com/preview\n")
+    (gptel-ui-mode 1)
+    (gptel-ui-refresh)
+    (let* ((target (current-buffer))
+           (position (copy-marker (point-max)))
+           (info (list :position position))
+           native)
+      (gptel-ui-render-test--buffer
+        (gptel-ui-mode 1)
+        (gptel-ui-refresh)
+        (should
+         (eq (gptel-ui--render-approval-change
+              (lambda (_calls context)
+                (with-current-buffer (marker-buffer (plist-get context :position))
+                  (setq native (make-overlay (point-min) (point-max)))
+                  (overlay-put native 'gptel-tool '(pending)))
+                'created)
+              nil info)
+             'created))
+        (let ((timer (buffer-local-value 'gptel-ui--timer target)))
+          (should (timerp timer))
+          (should-not gptel-ui--timer)
+          ;; Deletion loses the overlay's buffer; the wrapper captures it first.
+          (should (eq (gptel-ui--render-approval-change
+                       (lambda (_calls ov) (delete-overlay ov) 'deleted)
+                       nil native)
+                      'deleted))
+          ;; Successive changes reuse one timer, without refreshing the caller.
+          (should (eq timer (buffer-local-value 'gptel-ui--timer target)))
+          (should-not gptel-ui--timer))
+        (with-current-buffer target (gptel-ui-refresh))
+        ;; Minibuffer approvals and other operations with unchanged intervals
+        ;; must not schedule needless transcript rendering.
+        (gptel-ui--render-approval-change #'ignore nil info)
+        (should-not (buffer-local-value 'gptel-ui--timer target))
+        (should-not gptel-ui--timer))
+      (set-marker position nil))))
+
 (ert-deftest gptel-ui-render-reused-tool-gap-does-not-accumulate ()
   (gptel-ui-render-test--buffer
     (insert "@assistant\n#+begin_tool Read\n")

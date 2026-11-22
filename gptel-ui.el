@@ -505,11 +505,44 @@ transcript and ordinary markup remain untouched."
   (setq gptel-ui--approval-cache-dirty t)
   (force-mode-line-update t))
 
+(defun gptel-ui--approval-ranges ()
+  "Return sorted nonempty pending approval intervals in the current buffer."
+  (save-restriction
+    (widen)
+    (sort (cl-loop for ov in (overlays-in (point-min) (point-max))
+                   when (and (overlay-get ov 'gptel-tool)
+                             (< (overlay-start ov) (overlay-end ov)))
+                   collect (cons (overlay-start ov) (overlay-end ov)))
+          (lambda (a b) (if (= (car a) (car b))
+                            (< (cdr a) (cdr b))
+                          (< (car a) (car b)))))))
+
+(defun gptel-ui--render-approval-change (function &rest args)
+  "Call native approval FUNCTION with ARGS and schedule changed rendering.
+Capture the target buffer before native code can delete its approval overlay.
+Only changed approval intervals in that buffer need a coalesced refresh."
+  (let* ((context (cadr args))
+         (buffer (cond ((overlayp context) (overlay-buffer context))
+                       ((listp context)
+                        (let ((position (plist-get context :position)))
+                          (and (markerp position) (marker-buffer position))))))
+         (ranges (when (and (buffer-live-p buffer)
+                            (buffer-local-value 'gptel-ui-mode buffer))
+                   (with-current-buffer buffer (gptel-ui--approval-ranges)))))
+    (unwind-protect
+        (apply function args)
+      (when (and (buffer-live-p buffer)
+                 (buffer-local-value 'gptel-ui-mode buffer))
+        (with-current-buffer buffer
+          (unless (equal ranges (gptel-ui--approval-ranges))
+            (gptel-ui--schedule)))))))
+
 (defun gptel-ui--watch-approvals ()
   "Observe native approval changes while conversation headers are visible."
   (unless gptel-ui--watching-approvals
     (dolist (function gptel-ui--approval-functions)
-      (advice-add function :after #'gptel-ui--approvals-changed))
+      (advice-add function :after #'gptel-ui--approvals-changed)
+      (advice-add function :around #'gptel-ui--render-approval-change))
     (add-hook 'kill-buffer-hook #'gptel-ui--approvals-changed)
     (setq gptel-ui--watching-approvals t))
   (gptel-ui--approvals-changed))
@@ -517,7 +550,8 @@ transcript and ordinary markup remain untouched."
 (defun gptel-ui--unwatch-approvals ()
   "Stop observing approvals when the last conversation view closes."
   (dolist (function gptel-ui--approval-functions)
-    (advice-remove function #'gptel-ui--approvals-changed))
+    (advice-remove function #'gptel-ui--approvals-changed)
+    (advice-remove function #'gptel-ui--render-approval-change))
   (remove-hook 'kill-buffer-hook #'gptel-ui--approvals-changed)
   (setq gptel-ui--watching-approvals nil
         gptel-ui--approval-cache nil
@@ -611,13 +645,11 @@ transcript and ordinary markup remain untouched."
 
 (defun gptel-ui--link-exclusions ()
   "Snapshot structural, role and pending approval ranges excluding links."
-  (let ((ranges (copy-sequence gptel-ui--excluded)) (pos (point-min)))
-    ;; Approval overlays can change without changing the modification tick.
-    ;; Keep them out of the disjoint structural index: they can enclose blocks.
-    (dolist (ov (overlays-in (point-min) (point-max)))
-      (when (and (overlay-get ov 'gptel-tool)
-                 (< (overlay-start ov) (overlay-end ov)))
-        (push (cons (overlay-start ov) (overlay-end ov)) ranges)))
+  ;; Approval overlays can change without changing the modification tick.
+  ;; Keep them out of the disjoint structural index: they can enclose blocks.
+  (let ((ranges (append (gptel-ui--approval-ranges)
+                        (copy-sequence gptel-ui--excluded)))
+        (pos (point-min)))
     (while (< pos (point-max))
       (let ((next (next-single-property-change pos 'gptel nil (point-max)))
             (role (get-text-property pos 'gptel)))

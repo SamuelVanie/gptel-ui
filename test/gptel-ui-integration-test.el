@@ -192,11 +192,16 @@
         (set-marker position nil)))))
 
 (ert-deftest gptel-ui-integration-native-zero-width-preview-preserves-controls ()
-  (dolist (mode '(org-mode markdown-mode))
-    (gptel-ui-integration-test--chat mode
+  (dolist (case '((org-mode . "C-c C-c") (org-mode . "C-c C-k")
+                 (markdown-mode . "C-c C-c") (markdown-mode . "C-c C-k")))
+    (gptel-ui-integration-test--chat (car case)
+      (setq-local gptel-ui-refresh-delay 0.01)
       (insert "Fetch the URL.\n\n")
       (insert (propertize "Inspect https://example.com/preview\n\n" 'gptel 'response))
       (gptel-ui-mode 1)
+      ;; Cancel mode startup's timer so it cannot mask missing lifecycle work.
+      (gptel-ui-refresh)
+      (should-not gptel-ui--timer)
       (let* ((tool (gptel-make-tool
                     :name "UIIntegrationCustom" :description "Custom preview"
                     :function #'ignore :args nil))
@@ -215,15 +220,23 @@
         (search-forward "https://example.com/preview")
         (backward-char 2)
         (should (get-char-property (point) 'gptel-ui-link))
-        (gptel--display-tool-calls (list (list tool nil #'ignore)) info)
+        ;; Native display can be invoked from a different callback buffer.
+        (with-temp-buffer
+          (gptel--display-tool-calls (list (list tool nil #'ignore)) info))
         (should (= (overlay-start preview) (overlay-end preview)))
         (should (get-char-property (point) 'gptel-tool))
-        (gptel-ui-refresh)
+        (should (timerp gptel-ui--timer))
+        (sleep-for 0.05)
+        (should-not gptel-ui--timer)
         (should-not (get-char-property (point) 'gptel-ui-link))
         (should (eq (key-binding (kbd "C-c C-c")) #'gptel--accept-tool-calls))
         (should (eq (key-binding (kbd "C-c C-k")) #'gptel--reject-tool-calls))
-        (call-interactively (key-binding (kbd "C-c C-k")))
-        (gptel-ui-refresh)
+        (let ((modified (buffer-modified-tick)))
+          (call-interactively (key-binding (kbd (cdr case))))
+          (should (= modified (buffer-modified-tick))))
+        (should (timerp gptel-ui--timer))
+        (sleep-for 0.05)
+        (should-not gptel-ui--timer)
         (should (equal (get-char-property (point) 'gptel-ui-link)
                        "https://example.com/preview"))
         (should (= tick (buffer-chars-modified-tick)))
