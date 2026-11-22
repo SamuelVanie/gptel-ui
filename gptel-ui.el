@@ -808,12 +808,23 @@ their local observer already handles it, even if they exclude global hooks."
   (cl-pushnew #'gptel-ui--other-text-changed (default-value 'after-change-functions)))
 
 (defun gptel-ui--unwatch-text ()
-  "Unregister the current view from shared-text change notifications."
-  (remove-hook 'after-change-functions #'gptel-ui--text-changed t)
+  "Unregister the current view and release unneeded text observers."
   (let* ((base (or (buffer-base-buffer) (current-buffer)))
          (views (delq (current-buffer) (gethash base gptel-ui--text-views))))
-    (if views (puthash base views gptel-ui--text-views)
-      (remhash base gptel-ui--text-views)))
+    (if views
+        (progn
+          (puthash base views gptel-ui--text-views)
+          ;; Disabled editors that exclude global hooks still need their
+          ;; local observer until the last related presentation closes.
+          (when (memq t after-change-functions)
+            (remove-hook 'after-change-functions #'gptel-ui--text-changed t)))
+      (remhash base gptel-ui--text-views)
+      ;; Discover retained observers only at group teardown, never on edits.
+      ;; This also covers indirect clones made from a disabled editor.
+      (dolist (buffer (buffer-list))
+        (when (eq (or (buffer-base-buffer buffer) buffer) base)
+          (with-current-buffer buffer
+            (remove-hook 'after-change-functions #'gptel-ui--text-changed t))))))
   (when (zerop (hash-table-count gptel-ui--text-views))
     (set-default 'after-change-functions
                  (remq #'gptel-ui--other-text-changed
@@ -927,6 +938,14 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
 
 (defun gptel-ui--clone ()
   "Detach a cloned conversation from its source's presentation ownership."
+  ;; A disabled editor can retain an observer for another indirect view.
+  ;; Ordinary clones have independent text and must not inherit that hook.
+  (when (and (not gptel-ui-mode)
+             (local-variable-p 'after-change-functions)
+             (memq #'gptel-ui--text-changed after-change-functions))
+    (setq-local after-change-functions (copy-sequence after-change-functions))
+    (unless (gethash (or (buffer-base-buffer) (current-buffer)) gptel-ui--text-views)
+      (remove-hook 'after-change-functions #'gptel-ui--text-changed t)))
   (when gptel-ui-mode
     (let ((saved gptel-ui--saved)
           (header (nth 2 (assq 'header-line-format gptel-ui--saved))))

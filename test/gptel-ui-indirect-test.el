@@ -279,5 +279,65 @@
         (gptel-ui-mode -1))
       (should (equal after-change-functions '(ignore))))))
 
+(ert-deftest gptel-ui-indirect-disabled-local-hooks-still-notify-views ()
+  (dolist (origin '(base clone))
+    (dolist (teardown '(disable kill))
+      (with-temp-buffer
+        (setq-local after-change-functions '(ignore))
+        (let ((base (current-buffer))
+              (gptel-ui-refresh-delay 3600)
+              clone)
+          (unwind-protect
+              (progn
+                (gptel-ui-mode 1)
+                (setq clone (clone-indirect-buffer " *ui-disabled-hooks*" nil))
+                (let ((editor (if (eq origin 'base) base clone))
+                      (view (if (eq origin 'base) clone base)))
+                  (with-current-buffer editor (gptel-ui-mode -1))
+                  (with-current-buffer view (gptel-ui-refresh))
+                  (with-current-buffer editor
+                    (insert "[new](https://example.com/new)"))
+                  (gptel-ui-indirect-test--flush view)
+                  (with-current-buffer view
+                    (should (equal (gptel-ui-indirect-test--targets)
+                                   '("https://example.com/new")))
+                    (if (eq teardown 'kill) (kill-buffer view)
+                      (gptel-ui-mode -1)))
+                  (dolist (buffer (list base clone))
+                    (when (buffer-live-p buffer)
+                      (with-current-buffer buffer
+                        (should (equal after-change-functions '(ignore))))))))
+            (when (buffer-live-p clone) (kill-buffer clone))
+            (when (buffer-live-p base)
+              (with-current-buffer base (gptel-ui-mode -1)))))))))
+
+(ert-deftest gptel-ui-indirect-disabled-observer-clones-keep-text-ownership ()
+  (with-temp-buffer
+    (setq-local after-change-functions '(ignore))
+    (let ((base (current-buffer))
+          (gptel-ui-refresh-delay 3600)
+          view shared independent)
+      (unwind-protect
+          (progn
+            (gptel-ui-mode 1)
+            (setq view (clone-indirect-buffer " *ui-observer-view*" nil))
+            (gptel-ui-mode -1)
+            (setq shared (clone-indirect-buffer " *ui-observer-shared*" nil)
+                  independent (clone-buffer " *ui-observer-independent*" nil))
+            (with-current-buffer independent
+              (should-not gptel-ui-mode)
+              (should (equal after-change-functions '(ignore))))
+            (dolist (editor (list base shared))
+              (with-current-buffer view (gptel-ui-refresh))
+              (with-current-buffer editor (insert "[link](https://example.com/new)\n"))
+              (gptel-ui-indirect-test--flush view))
+            (kill-buffer view)
+            (dolist (editor (list base shared independent))
+              (with-current-buffer editor
+                (should (equal after-change-functions '(ignore))))))
+        (dolist (buffer (list independent shared view))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))
+        (when (buffer-live-p base) (gptel-ui-mode -1))))))
+
 (provide 'gptel-ui-indirect-test)
 ;;; gptel-ui-indirect-test.el ends here
