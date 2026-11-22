@@ -1,5 +1,7 @@
 # gptel-ui
 
+![illustration](./img/illustration.png)
+
 `gptel-ui` provides the optional **Atelier** reading view for ordinary gptel
 conversations in Org and Markdown. It owns chat presentation, including
 conversations opened by `gptel-runner` and discussion tools. Jobs, pipelines,
