@@ -59,11 +59,12 @@
           (gptel-ui-mode 1)
           (unwind-protect
               (progn
-                (should-not (string-match-p "approval" (gptel-ui--header)))
+                (should-not (string-match-p " ! [0-9]+ approval" (gptel-ui--header)))
                 (let ((approval
                        (with-current-buffer worker
                          (insert "Pending tool call")
                          (let ((ov (make-overlay (point-min) (point-max))))
+                           (overlay-put ov 'info (list :position (point-marker)))
                            (overlay-put ov 'gptel-tool '(pending))
                            (overlay-put ov 'keymap gptel-tool-call-actions-map)
                            ov))))
@@ -81,7 +82,7 @@
                              (get-text-property badge 'help-echo header))))
                   ;; Cancellation or a killed worker must not leave stale badges.
                   (delete-overlay approval)
-                  (should-not (string-match-p "approval" (gptel-ui--header)))))
+                  (should-not (string-match-p " ! [0-9]+ approval" (gptel-ui--header)))))
             (gptel-ui-mode -1)))
       (kill-buffer worker))))
 

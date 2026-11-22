@@ -297,6 +297,68 @@
                   (should (eq (overlay-buffer overlay) source))))
             (kill-buffer clone)))))))
 
+(ert-deftest gptel-ui-integration-indirect-approval-controls-stay-with-source ()
+  (dolist (view '(native atelier source))
+    (dolist (custom-preview '(nil t))
+      (ert-info ((format "View %s, custom preview %s" view custom-preview))
+        (gptel-ui-integration-test--chat #'org-mode
+          (unless (eq view 'native) (gptel-ui-mode 1))
+          (when (eq view 'source) (gptel-ui-toggle-source))
+          (insert (propertize "Checking the fixture.\n\n" 'gptel 'response))
+          (let* ((source (current-buffer))
+                 (gptel--known-tools (copy-tree gptel--known-tools))
+                 (tool (gptel-make-tool :name "UICloneApproval" :description "Fixture"
+                                       :function #'ignore :args nil))
+                 (info (list :position (point-marker)
+                             :backend (gptel--make-backend :name "UI integration")))
+                 (preview-map (make-composed-keymap (make-sparse-keymap)
+                                                     gptel-tool-call-actions-map))
+                 (gptel--tool-preview-alist
+                  (when custom-preview
+                    (list (list "UICloneApproval"
+                                (lambda (_args _info)
+                                  (let ((start (point)))
+                                    (insert "Fixture preview\n")
+                                    (let ((ov (make-overlay start (point))))
+                                      (overlay-put ov 'keymap preview-map)
+                                      ov)))
+                                #'delete-overlay))))
+                 (prompt (gptel--display-tool-calls (list (list tool nil #'ignore)) info))
+                 (banner (overlay-get prompt 'before-string))
+                 (original (car (gptel-ui-tools-pending-approvals)))
+                 (position (overlay-start prompt))
+                 (clone (clone-indirect-buffer " *ui-pending-clone*" nil)))
+            (unwind-protect
+                (save-window-excursion
+                  (should (eq (overlay-buffer original) source))
+                  (should (eq (overlay-buffer prompt) source))
+                  (should banner)
+                  (should (equal (gptel-ui-tools-pending-approvals) (list original)))
+                  (when gptel-ui-mode
+                    (should (string-match-p "1 approval" (gptel-ui--header))))
+                  (with-current-buffer clone
+                    (goto-char position)
+                    (should-not (get-char-property (point) 'gptel-tool))
+                    (should-not (eq (key-binding (kbd "C-c C-k")) #'gptel--reject-tool-calls))
+                    (dolist (ov (overlays-in (point-min) (point-max)))
+                      (should-not (equal (overlay-get ov 'before-string) banner))
+                      (should-not (eq (overlay-get ov 'keymap) preview-map)))
+                    ;; Bare native chats need no transient map for this single jump.
+                    (cl-letf (((symbol-function 'set-transient-map) #'ignore))
+                      (should (eq (gptel-ui-next-approval) original)))
+                    (should (eq (current-buffer) source))
+                    (should (eq (key-binding (kbd "C-c C-k")) #'gptel--reject-tool-calls))
+                    (call-interactively #'gptel--reject-tool-calls))
+                  (should-not (overlay-buffer original))
+                  (should-not (gptel-ui-tools-pending-approvals))
+                  (when gptel-ui-mode
+                    (should-not (string-match-p " ! [0-9]+ approval" (gptel-ui--header))))
+                  (with-current-buffer clone
+                    (goto-char (point-min))
+                    (should-not (get-char-property (point) 'gptel-tool))
+                    (should-not (eq (key-binding (kbd "C-c C-c")) #'gptel--accept-tool-calls))))
+              (kill-buffer clone))))))))
+
 (ert-deftest gptel-ui-integration-cross-buffer-native-approval-decisions ()
   (let ((gptel-mode-hook nil)
         (gptel-ui-global-mode nil)
@@ -355,7 +417,7 @@
           (should (= completed 1))
           (should-not (gptel-ui-tools-pending-approvals))
           (with-current-buffer parent
-            (should-not (string-match-p "approval" (gptel-ui--header)))))
+            (should-not (string-match-p " ! [0-9]+ approval" (gptel-ui--header)))))
       (dolist (position positions) (set-marker position nil))
       (dolist (buffer (cons parent children))
         (when (buffer-live-p buffer)

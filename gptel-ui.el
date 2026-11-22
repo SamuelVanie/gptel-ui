@@ -603,7 +603,7 @@ Only changed approval intervals in that buffer need a coalesced refresh."
   ;; Buffer deletion and cancellation can remove overlays outside native
   ;; approval commands.  Never keep a dead prompt visible in the header.
   (setq gptel-ui--approval-cache
-        (cl-remove-if-not #'overlay-buffer gptel-ui--approval-cache))
+        (cl-remove-if-not #'gptel-ui-tools--pending-approval-p gptel-ui--approval-cache))
   (when gptel-ui--approval-cache
     (let* ((count (length gptel-ui--approval-cache))
            (buffers (delete-dups
@@ -938,6 +938,21 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
 
 (defun gptel-ui--clone ()
   "Detach a cloned conversation from its source's presentation ownership."
+  ;; Remove copied approval controls even in a chat without Atelier.  When
+  ;; rebuilding a decorated view, also discard its untracked UI overlays.
+  (let* ((lists (overlay-lists))
+         (overlays (append (car lists) (cdr lists))))
+    (dolist (ov overlays)
+      (cond
+       ((and (gptel-ui-tools--dispatch-overlay-p ov)
+             (not (eq (overlay-buffer ov) (gptel-ui-tools--approval-buffer ov))))
+        (gptel-ui-tools--detach-cloned-approval ov overlays))
+       ((and gptel-ui-mode
+             (or (overlay-get ov 'gptel-ui)
+                 (overlay-get ov 'gptel-ui-links)
+                 (overlay-get ov 'gptel-ui-tables)
+                 (overlay-get ov 'gptel-ui-tool)))
+        (delete-overlay ov)))))
   ;; A disabled editor can retain an observer for another indirect view.
   ;; Ordinary clones have independent text and must not inherit that hook.
   (when (and (not gptel-ui-mode)
@@ -957,17 +972,6 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
       (when (and gptel-ui--native-header
                  (eq header-line-format gptel-ui--installed-header))
         (setf (nth 1 header) (nth 1 header-line-format)))
-      ;; Emacs also copies overlays into indirect clones, but the copied
-      ;; ownership list still points at the source's originals.  Remove only
-      ;; our decorations in this buffer before rebuilding its presentation.
-      ;; Otherwise an untracked table copy can keep hiding subsequent prose.
-      (let ((overlays (overlay-lists)))
-        (dolist (overlay (append (car overlays) (cdr overlays)))
-          (when (or (overlay-get overlay 'gptel-ui)
-                    (overlay-get overlay 'gptel-ui-links)
-                    (overlay-get overlay 'gptel-ui-tables)
-                    (overlay-get overlay 'gptel-ui-tool))
-            (delete-overlay overlay))))
       ;; These locals were copied by reference.  Do not disable the mode or
       ;; run its cleanup before dropping the source's overlays and timer.
       (setq gptel-ui-mode nil

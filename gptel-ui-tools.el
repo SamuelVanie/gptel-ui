@@ -71,13 +71,49 @@
                       (eq (overlay-get ov 'keymap) gptel-tool-call-actions-map))))
            (overlays-in beg end)))
 
-(defun gptel-ui-tools--pending-approval-p (overlay)
-  "Whether OVERLAY is a live native tool approval, not an inspection copy."
+(defun gptel-ui-tools--dispatch-overlay-p (overlay)
+  "Whether OVERLAY carries the native tool approval actions."
   (and (overlay-buffer overlay)
        (overlay-get overlay 'gptel-tool)
        (boundp 'gptel-tool-call-actions-map)
        gptel-tool-call-actions-map
        (eq (overlay-get overlay 'keymap) gptel-tool-call-actions-map)))
+
+(defun gptel-ui-tools--approval-buffer (overlay)
+  "Return the buffer where gptel displays the request for OVERLAY."
+  ;; A worker can direct its prompt to a buffer other than INFO's :buffer.
+  (let ((position (plist-get (overlay-get overlay 'info) :position)))
+    (if (markerp position)
+        (marker-buffer position)
+      ;; Older gptel dispatchers carried the original prompt without INFO.
+      (let ((prompt (car (ensure-list (overlay-get overlay 'prompt)))))
+        (and (overlayp prompt) (overlay-buffer prompt))))))
+
+(defun gptel-ui-tools--pending-approval-p (overlay)
+  "Whether OVERLAY is a live dispatch overlay in its request's display buffer."
+  (and (gptel-ui-tools--dispatch-overlay-p overlay)
+       (eq (overlay-buffer overlay) (gptel-ui-tools--approval-buffer overlay))))
+
+(defun gptel-ui-tools--detach-cloned-approval (dispatch overlays)
+  "Remove the clone's copies of DISPATCH and its controls from OVERLAYS."
+  ;; Cloning copies the overlays but leaves the dispatcher's references to
+  ;; the source prompts and preview handles intact.  Never run their teardown
+  ;; or change shared text.  Match each overlay handle to its shallow copy.
+  (let ((base (buffer-base-buffer)))
+    (dolist (part (append (ensure-list (overlay-get dispatch 'prompt))
+                          (mapcar #'cadr (overlay-get dispatch 'previews))))
+      (when (and (overlayp part) (overlay-buffer part)
+                 (eq base (or (buffer-base-buffer (overlay-buffer part))
+                              (overlay-buffer part))))
+        (let ((copy (cl-find-if
+                     (lambda (ov)
+                       (and (equal (overlay-start ov) (overlay-start part))
+                            (equal (overlay-end ov) (overlay-end part))
+                            (not (cl-mismatch (overlay-properties ov)
+                                              (overlay-properties part) :test #'eq))))
+                     overlays)))
+          (when copy (delete-overlay copy))))))
+  (delete-overlay dispatch))
 
 (defun gptel-ui-tools--approval-position (overlay)
   "Return a position at OVERLAY's prompt with native approval keys active."
@@ -89,7 +125,7 @@
                           (eq (overlay-buffer prompt) (overlay-buffer overlay))
                           (<= start (overlay-start prompt))
                           (<= (overlay-start prompt) end)))
-                   (overlay-get overlay 'prompt)))
+                   (ensure-list (overlay-get overlay 'prompt))))
          (position (if prompts
                        (apply #'min (mapcar #'overlay-start prompts))
                      start)))

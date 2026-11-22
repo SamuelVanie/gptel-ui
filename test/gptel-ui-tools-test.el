@@ -138,6 +138,7 @@ INCOMPLETE omits the closing fence."
 When non-nil, PROMPT-START marks the visible prompt within the dispatch area."
   (with-current-buffer buffer
     (let ((overlay (make-overlay start end)))
+      (overlay-put overlay 'info (list :position (copy-marker start)))
       (overlay-put overlay 'gptel-tool '(pending))
       (overlay-put overlay 'keymap gptel-tool-call-actions-map)
       (when prompt-start
@@ -170,6 +171,46 @@ When non-nil, PROMPT-START marks the visible prompt within the dispatch area."
             (should (= (point-max) 59))))
       (kill-buffer first)
       (kill-buffer second))))
+
+(ert-deftest gptel-ui-tools-discover-approval-in-its-request-view ()
+  (let ((gptel-tool-call-actions-map (make-sparse-keymap)))
+    (with-temp-buffer
+      (insert "shared transcript")
+      (let* ((base (current-buffer))
+             (original (gptel-ui-tools-test--approval base 1 6))
+             ;; A clone can predate loading Atelier and its clone hooks.
+             (view (let ((clone-indirect-buffer-hook nil))
+                     (clone-indirect-buffer " *ui-existing-approval-view*" nil))))
+        (unwind-protect
+            (with-current-buffer view
+              (should (get-char-property (point-min) 'gptel-tool))
+              (let ((own (gptel-ui-tools-test--approval view 7 (point-max))))
+                (let ((pending (gptel-ui-tools-pending-approvals)))
+                  (should (= (length pending) 2))
+                  (should (memq original pending))
+                  (should (memq own pending)))
+                (delete-overlay original)
+                (should (equal (gptel-ui-tools-pending-approvals) (list own)))
+                (set-marker (plist-get (overlay-get own 'info) :position) nil)
+                (should-not (gptel-ui-tools-pending-approvals))))
+          (kill-buffer view))))))
+
+(ert-deftest gptel-ui-tools-legacy-dispatch-uses-original-prompt-buffer ()
+  (let ((gptel-tool-call-actions-map (make-sparse-keymap)))
+    (with-temp-buffer
+      (insert "legacy prompt")
+      (let* ((prompt (make-overlay 4 (point-max)))
+             (dispatch (gptel-ui-tools-test--approval (current-buffer) 1 (point-max))))
+        ;; gptel 0.9.9.4 used a single prompt overlay and no info plist.
+        (overlay-put dispatch 'info nil)
+        (overlay-put dispatch 'prompt prompt)
+        (let ((view (let ((clone-indirect-buffer-hook nil))
+                      (clone-indirect-buffer " *ui-legacy-approval-view*" nil))))
+          (unwind-protect
+              (progn
+                (should (equal (gptel-ui-tools-pending-approvals) (list dispatch)))
+                (should (= (gptel-ui-tools--approval-position dispatch) 4)))
+            (kill-buffer view)))))))
 
 (ert-deftest gptel-ui-tools-cycle-prompts-across-buffers-and-wrap ()
   (let ((gptel-tool-call-actions-map (make-sparse-keymap))
