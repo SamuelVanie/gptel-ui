@@ -16,6 +16,7 @@
 (require 'project)
 
 (defvar org-link-bracket-re)
+(defvar org-link-types-re)
 (declare-function org-element-at-point "org-element" (&optional epom cached-only))
 (declare-function org-element-property "org-element-ast" (property node &optional dflt force-undefer))
 (declare-function org-element-type "org-element-ast" (element &optional anonymous))
@@ -212,13 +213,19 @@ RANGES is a vector of half-open (START . END) intervals."
   (pcase (plist-get destination :type)
     ('web (not (string-search "\\" target)))
     ('file
-     ;; Org treats unqualified names as fuzzy links, even if they look
-     ;; like filenames.  Its non-numeric file search options also need Org.
-     (and (or (string-prefix-p "file:" target)
-              (file-name-absolute-p target)
-              (string-match-p "\\`\\.\\.?/" target))
-          (not (string-match-p "[\\\\\n]" target))
-          (not (string-search "::" (plist-get destination :path)))))))
+     (let ((path (plist-get destination :path)))
+       (and (not (string-match-p "[\\\\\n]" target))
+            (not (string-search "::" path))
+            (or (string-prefix-p "file:" target)
+                (file-name-absolute-p target)
+                (string-match-p "\\`\\.\\.?/" target)
+                ;; A numeric location on an existing workspace file is a chat
+                ;; reference.  Let Org handle fuzzy names and its own schemes.
+                (and (plist-get destination :line)
+                     (not (string-prefix-p "*" target))
+                     (not (string-match-p org-link-types-re target))
+                     (when-let* ((file (gptel-ui-links--resolve path)))
+                       (file-regular-p file)))))))))
 
 (defun gptel-ui-links--org-rescan-start (start)
   "Return START or the line of an earlier possible Org bracket link opener."

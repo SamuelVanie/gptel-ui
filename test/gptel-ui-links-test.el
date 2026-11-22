@@ -440,5 +440,53 @@
             (should (eq (key-binding (kbd "C-c C-o")) 'org-open-at-point)))
         (gptel-ui-mode -1)))))
 
+(ert-deftest gptel-ui-links-org-relative-file-location ()
+  (require 'org)
+  (require 'gptel-ui)
+  (let* ((directory (make-temp-file "gptel-org-location-" t))
+         (file (expand-file-name "test/source.el" directory)))
+    (unwind-protect
+        (save-window-excursion
+          (make-directory (file-name-directory file))
+          (with-temp-file file (insert "line one\nline two\n"))
+          (with-temp-buffer
+            (switch-to-buffer (current-buffer))
+            (org-mode)
+            (setq default-directory (file-name-as-directory directory))
+            (insert "* Missing:2\n* test/source.el\n\n"
+                    "[[test/source.el:2:3][open file]]\n"
+                    "[[Missing:2][jump to heading]]\n"
+                    "[[test/source.el][filename heading]]\n"
+                    "| Location |\n|----------|\n| [[test/source.el:2:3][table link]] |\n")
+            (gptel-ui-mode 1)
+            (let ((chat (current-buffer)))
+              (dolist (label '("open file" "table link"))
+                (switch-to-buffer chat)
+                (goto-char (point-min))
+                (search-forward label)
+                (backward-char)
+                (call-interactively (key-binding (kbd "C-c C-o")))
+                (should (file-equal-p buffer-file-name file))
+                (should (= (line-number-at-pos) 2))
+                (should (= (current-column) 2)))
+              (switch-to-buffer chat)
+              (goto-char (point-min))
+              (search-forward "jump to heading")
+              (backward-char)
+              (should (eq (key-binding (kbd "C-c C-o")) 'org-open-at-point))
+              (call-interactively #'org-open-at-point)
+              (should (= (line-number-at-pos) 1))
+              (search-forward "filename heading")
+              (backward-char)
+              (should (eq (key-binding (kbd "C-c C-o")) 'org-open-at-point))
+              (call-interactively #'org-open-at-point)
+              (should (= (line-number-at-pos) 2))
+              (gptel-ui-toggle-source)
+              (search-forward "open file")
+              (backward-char)
+              (should (eq (key-binding (kbd "C-c C-o")) 'org-open-at-point)))))
+      (when-let* ((buffer (get-file-buffer file))) (kill-buffer buffer))
+      (delete-directory directory t))))
+
 (provide 'gptel-ui-links-test)
 ;;; gptel-ui-links-test.el ends here
