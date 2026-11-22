@@ -393,17 +393,23 @@ transcript and ordinary markup remain untouched."
 
 (defun gptel-ui--tool-response-spacing ()
   "Add two display-only blank lines before prose following tool activity."
-  (dolist (beg gptel-ui--tool-response-starts)
-    ;; Attach to an existing replacement when the answer starts with a
-    ;; heading, table, link or code block, so the gap stays visible too.
-    (let ((ov (or (cl-find-if
-                   (lambda (item) (and (= (overlay-start item) beg)
-                                       (overlay-get item 'display)))
-                   gptel-ui--overlays)
-                  (gptel-ui--overlay beg (min (point-max) (1+ beg))
-                                              'priority 30))))
-      (overlay-put ov 'before-string (concat "\n\n" (overlay-get ov 'before-string)))
-      (overlay-put ov 'gptel-ui-tool-gap t))))
+  (when gptel-ui--tool-response-starts
+    ;; Index once, keeping the first owned replacement at each exact start.
+    ;; Rescanning all overlays for each historical response is quadratic.
+    (let ((replacements (make-hash-table :test #'eql)))
+      (dolist (ov gptel-ui--overlays)
+        (when (overlay-get ov 'display)
+          (let ((beg (overlay-start ov)))
+            (unless (gethash beg replacements)
+              (puthash beg ov replacements)))))
+      (dolist (beg gptel-ui--tool-response-starts)
+        ;; Share the heading, table, link or code replacement so the gap
+        ;; stays visible when the source at BEG is replaced.
+        (let ((ov (or (gethash beg replacements)
+                      (gptel-ui--overlay beg (min (point-max) (1+ beg))
+                                         'priority 30))))
+          (overlay-put ov 'before-string (concat "\n\n" (overlay-get ov 'before-string)))
+          (overlay-put ov 'gptel-ui-tool-gap t))))))
 
 (defun gptel-ui--headings ()
   "Style headings, list bullets, quotations, and inline emphasis."
