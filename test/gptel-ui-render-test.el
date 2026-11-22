@@ -155,6 +155,55 @@
     (gptel-ui-toggle-source)
     (gptel-ui-render-test--matches-full)))
 
+(ert-deftest gptel-ui-render-approval-changes-without-text-edits ()
+  (gptel-ui-render-test--buffer
+    (insert "https://example.com/one\nhttps://example.com/two\n")
+    (gptel-ui-mode 1)
+    (let* ((first (point-min))
+           (second (save-excursion (goto-char first) (forward-line 1) (point)))
+           (native (make-overlay first second))
+           (map (make-sparse-keymap))
+           (tick (buffer-modified-tick))
+           (source (buffer-string)))
+      (define-key map (kbd "C-c C-c") #'ignore)
+      (define-key map (kbd "C-c C-k") #'ignore)
+      (overlay-put native 'keymap map)
+      (cl-labels
+          ((check (targets)
+             ;; No edit or dirty suffix may be needed to invalidate links.
+             (should (= tick (buffer-modified-tick)))
+             (should-not gptel-ui--link-dirty-start)
+             (gptel-ui-refresh)
+             (should (equal
+                      (sort (cl-loop for ov in gptel-ui--overlays
+                                     when (overlay-get ov 'gptel-ui-links)
+                                     collect (overlay-get ov 'gptel-ui-link))
+                            #'string<)
+                      targets))
+             (should (equal-including-properties source (buffer-string)))
+             (gptel-ui-render-test--matches-full)))
+        ;; An overlay-only approval must remove an already cached link.
+        ;; Its end is exactly the next link's start: that link stays active.
+        (overlay-put native 'gptel-tool '(pending))
+        (check '("https://example.com/two"))
+        (goto-char first)
+        (should (eq (key-binding (kbd "C-c C-c")) #'ignore))
+        (should (eq (key-binding (kbd "C-c C-k")) #'ignore))
+        ;; The approval starts inside a candidate; exclude the entire link.
+        (move-overlay native (+ second 5) (1- (point-max)))
+        (check '("https://example.com/one"))
+        (overlay-put native 'gptel-tool nil)
+        (check '("https://example.com/one" "https://example.com/two"))
+        (overlay-put native 'gptel-tool '(pending))
+        (check '("https://example.com/one"))
+        ;; Empty custom preview overlays cover no source characters.
+        (move-overlay native (+ second 5) (+ second 5))
+        (check '("https://example.com/one" "https://example.com/two"))
+        (move-overlay native second (point-max))
+        (check '("https://example.com/one"))
+        (delete-overlay native)
+        (check '("https://example.com/one" "https://example.com/two"))))))
+
 (ert-deftest gptel-ui-render-resize-reuses-links-and-reflows-tables ()
   (gptel-ui-render-test--buffer
     (insert "[outside](a.el)\n| Name | Details |\n| --- | --- |\n| [inside](b.el) | A long description of this item |\n")
@@ -172,6 +221,77 @@
                                 (cl-find-if (lambda (ov) (overlay-get ov 'gptel-ui-table))
                                             gptel-ui--overlays) 'display)))
         (gptel-ui-render-test--matches-full)))))
+
+(ert-deftest gptel-ui-render-approval-preserves-controls-over-table-links ()
+  (gptel-ui-render-test--buffer
+    (insert "| Link |\n| --- |\n| [preview](https://example.com/preview) |\n")
+    (let ((end (point)))
+      (insert "https://example.com/ordinary\n")
+      (gptel-ui-mode 1)
+      (should (cl-some (lambda (ov) (overlay-get ov 'gptel-ui-table))
+                      gptel-ui--overlays))
+      (let ((native (make-overlay (point-min) end))
+            (map (make-sparse-keymap))
+            (tick (buffer-modified-tick)))
+        (define-key map (kbd "C-c C-c") #'ignore)
+        (overlay-put native 'keymap map)
+        (overlay-put native 'gptel-tool '(pending))
+        (gptel-ui-refresh)
+        (should (= tick (buffer-modified-tick)))
+        (should-not (cl-some (lambda (ov) (overlay-get ov 'gptel-ui-table))
+                            gptel-ui--overlays))
+        (goto-char (point-min))
+        (search-forward "https://example.com/preview")
+        (backward-char 2)
+        (should-not (get-char-property (point) 'gptel-ui-link))
+        (should (eq (key-binding (kbd "C-c C-c")) #'ignore))
+        (goto-char end)
+        (should (eq (key-binding (kbd "RET")) #'gptel-ui-links-open))
+        (delete-overlay native)
+        (gptel-ui-refresh)
+        (should (= tick (buffer-modified-tick)))
+        (should (cl-some (lambda (ov) (overlay-get ov 'gptel-ui-table))
+                        gptel-ui--overlays))))))
+
+(ert-deftest gptel-ui-render-approval-change-schedules-only-affected-buffer ()
+  (gptel-ui-render-test--buffer
+    (insert "https://example.com/preview\n")
+    (gptel-ui-mode 1)
+    (gptel-ui-refresh)
+    (let* ((target (current-buffer))
+           (position (copy-marker (point-max)))
+           (info (list :position position))
+           native)
+      (gptel-ui-render-test--buffer
+        (gptel-ui-mode 1)
+        (gptel-ui-refresh)
+        (should
+         (eq (gptel-ui--render-approval-change
+              (lambda (_calls context)
+                (with-current-buffer (marker-buffer (plist-get context :position))
+                  (setq native (make-overlay (point-min) (point-max)))
+                  (overlay-put native 'gptel-tool '(pending)))
+                'created)
+              nil info)
+             'created))
+        (let ((timer (buffer-local-value 'gptel-ui--timer target)))
+          (should (timerp timer))
+          (should-not gptel-ui--timer)
+          ;; Deletion loses the overlay's buffer; the wrapper captures it first.
+          (should (eq (gptel-ui--render-approval-change
+                       (lambda (_calls ov) (delete-overlay ov) 'deleted)
+                       nil native)
+                      'deleted))
+          ;; Successive changes reuse one timer, without refreshing the caller.
+          (should (eq timer (buffer-local-value 'gptel-ui--timer target)))
+          (should-not gptel-ui--timer))
+        (with-current-buffer target (gptel-ui-refresh))
+        ;; Minibuffer approvals and other operations with unchanged intervals
+        ;; must not schedule needless transcript rendering.
+        (gptel-ui--render-approval-change #'ignore nil info)
+        (should-not (buffer-local-value 'gptel-ui--timer target))
+        (should-not gptel-ui--timer))
+      (set-marker position nil))))
 
 (ert-deftest gptel-ui-render-reused-tool-gap-does-not-accumulate ()
   (gptel-ui-render-test--buffer
