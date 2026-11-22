@@ -19,7 +19,7 @@
 (declare-function gptel-ui-demo "gptel-ui" ())
 (declare-function gptel-ui-links-open "gptel-ui-links" (&optional event))
 (declare-function gptel-ui-links-string "gptel-ui-links" (label target))
-(declare-function gptel-ui-links-render "gptel-ui-links" (start end &optional skip-p))
+(declare-function gptel-ui-links-render "gptel-ui-links" (start end &optional skip-p org-table-cell))
 (declare-function gptel-ui-tables-render "gptel-ui-tables" (start end &optional skip-p))
 (declare-function gptel-ui-tools-toggle "gptel-ui-tools" (&optional event))
 (declare-function gptel-ui-tools-render-block "gptel-ui-tools" (beg opening-end body-beg close-beg end info))

@@ -15,10 +15,17 @@
 (require 'cl-lib)
 (require 'subr-x)
 
+(declare-function gptel-ui-links-open "gptel-ui-links" (&optional event))
 (declare-function gptel-ui-links-render "gptel-ui-links"
-                  (start end &optional skip-p))
+                  (start end &optional skip-p org-table-cell))
 (declare-function gptel-ui-links-string "gptel-ui-links"
                   (label target))
+
+(defvar gptel-ui-tables-link-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-o") #'gptel-ui-links-open)
+    map)
+  "Keymap on rendered tables with link actions.")
 
 (defgroup gptel-ui-tables nil
   "Readable tables in gptel conversations."
@@ -108,14 +115,15 @@ This is a display-column limit, measured using the fixed-pitch table font."
 
 (defun gptel-ui-tables--cell (text)
   "Return display TEXT with unobtrusive inline markup."
-  (let ((text (replace-regexp-in-string "<br[ \t]*/?>" " " text t t)))
+  (let ((org-table-cell (derived-mode-p 'org-mode))
+        (text (replace-regexp-in-string "<br[ \t]*/?>" " " text t t)))
     (when (fboundp 'gptel-ui-links-render)
       (setq text
             (with-temp-buffer
               (insert text)
               (let ((position (point-min)) pieces)
                 (dolist (overlay
-                         (sort (gptel-ui-links-render (point-min) (point-max))
+                         (sort (gptel-ui-links-render (point-min) (point-max) nil org-table-cell)
                                (lambda (a b) (< (overlay-start a) (overlay-start b)))))
                   (push (buffer-substring-no-properties position (overlay-start overlay)) pieces)
                   (push (or (overlay-get overlay 'display)
@@ -264,6 +272,8 @@ owns these overlays; source text and its text properties remain untouched."
                                '(:inherit default :inverse-video nil :underline nil
                                  :overline nil :strike-through nil :box nil :extend nil))
                   (overlay-put overlay 'display display)
+                  (when (text-property-not-all 0 (length display) 'gptel-ui-link nil display)
+                    (overlay-put overlay 'keymap gptel-ui-tables-link-map))
                   (overlay-put overlay 'line-prefix nil)
                   (overlay-put overlay 'wrap-prefix nil)
                   (overlay-put overlay 'help-echo
