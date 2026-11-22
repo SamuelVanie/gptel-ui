@@ -129,10 +129,18 @@ reorder the queue.  Each overlay represents one native approval group."
 Native approval actions continue to come from the original overlay.")
 
 (defun gptel-ui-tools--keep-navigation-p ()
-  "Keep temporary navigation while cycling or using native approval actions."
-  (memq this-command '(gptel-ui-next-approval gptel-ui-previous-approval
-                      gptel--accept-tool-calls gptel--reject-tool-calls
-                      gptel--steer-tool-calls gptel--inspect-tool-calls)))
+  "Keep temporary navigation through native approval and inspection actions."
+  ;; Steering reads instructions in the minibuffer.  Its input is part of
+  ;; the approval action; unrelated commands end the map before prompting.
+  (or (minibufferp)
+      (memq this-command '(gptel-ui-next-approval gptel-ui-previous-approval
+                          gptel--accept-tool-calls gptel--reject-tool-calls
+                          gptel--steer-tool-calls gptel--inspect-tool-calls
+                          gptel--inspect-accept-tool-calls
+                          gptel--inspect-reject-tool-calls
+                          gptel--inspect-steer-tool-calls
+                          gptel--inspect-quit-tool-calls
+                          gptel-agent-allow-outside-access))))
 
 (defun gptel-ui-next-approval (&optional previous)
   "Visit the next pending tool approval across all buffers, wrapping around.

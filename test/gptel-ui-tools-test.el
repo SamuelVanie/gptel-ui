@@ -279,5 +279,35 @@ When non-nil, PROMPT-START marks the visible prompt within the dispatch area."
       (when exit-function (funcall exit-function))
       (kill-buffer buffer))))
 
+(ert-deftest gptel-ui-tools-navigation-ends-before-unrelated-minibuffer ()
+  (let ((gptel-tool-call-actions-map (make-sparse-keymap))
+        (buffer (generate-new-buffer " *ui-approval-minibuffer*"))
+        (overriding-terminal-local-map nil)
+        (pre-command-hook nil)
+        (original-set-transient-map (symbol-function 'set-transient-map))
+        prompted exit-function)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (text-mode)
+          (insert "response\npending\n")
+          (gptel-ui-tools-test--approval buffer 1 (point-max) 10)
+          (cl-letf (((symbol-function 'set-transient-map)
+                     (lambda (&rest args)
+                       (setq exit-function (apply original-set-transient-map args)))))
+            (gptel-ui-next-approval))
+          (should (eq (key-binding (kbd "C-c ]")) #'gptel-ui-next-approval))
+          (let ((noninteractive nil)
+                (minibuffer-setup-hook
+                 (list (lambda ()
+                         (setq prompted t)
+                         (should-not (eq (key-binding (kbd "C-c ]"))
+                                         #'gptel-ui-next-approval))))))
+            (execute-kbd-macro (vconcat (kbd "M-:") "nil" (kbd "RET"))))
+          (should prompted)
+          (should-not (eq (key-binding (kbd "C-c ]")) #'gptel-ui-next-approval)))
+      (when exit-function (funcall exit-function))
+      (kill-buffer buffer))))
+
 (provide 'gptel-ui-tools-test)
 ;;; gptel-ui-tools-test.el ends here
