@@ -281,5 +281,164 @@
       (should (< large (* 3 small)))
       (should (< large (* 128 80))))))
 
+(ert-deftest gptel-ui-links-leaves-org-internal-links-to-org ()
+  (require 'org)
+  (require 'gptel-ui)
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (org-mode)
+      (insert "* Destination\n:PROPERTIES:\n:CUSTOM_ID: here\n:END:\n"
+              "* Sender\n[[*Destination][https://description.test]]\n"
+              "[[Destination]]\n[[#here][via ID]]\n[[file:other.org::*Title][section]]\n"
+              "[[*Destination][a multiline description\nhttps://nested.test]]\n"
+              "[[file:a\\[b\\].org][escaped]]\n")
+      (unwind-protect
+          (progn
+            (gptel-ui-mode 1)
+            (dolist (view '(reading source))
+              (when (eq view 'source)
+                (call-interactively (key-binding (kbd "C-c C-v"))))
+              (dolist (needle '("https://description.test" "[[Destination" "via ID"
+                                "https://nested.test"))
+                (goto-char (point-min))
+                (search-forward needle)
+                (backward-char)
+                (should-not (get-char-property (point) 'gptel-ui-link))
+                (let ((command (key-binding (kbd "C-c C-o"))))
+                  (should (eq command 'org-open-at-point))
+                  (call-interactively command))
+                (should (= (line-number-at-pos) 1)))
+              (dolist (label '("section" "escaped"))
+                (goto-char (point-max))
+                (search-backward label)
+                (should (eq (key-binding (kbd "C-c C-o")) 'org-open-at-point)))))
+        (gptel-ui-mode -1)))))
+
+(ert-deftest gptel-ui-links-scope-open-key-to-displayed-references ()
+  (require 'gptel-ui)
+  (with-temp-buffer
+    (use-local-map (make-sparse-keymap))
+    (local-set-key (kbd "C-c C-o") #'forward-char)
+    (insert "Plain text\n[source](src.el:9:4)\n")
+    (unwind-protect
+        (progn
+          (gptel-ui-mode 1)
+          (goto-char (point-min))
+          (should (eq (key-binding (kbd "C-c C-o")) 'forward-char))
+          (search-forward "source")
+          (dolist (key '("RET" "<mouse-1>" "C-c C-o"))
+            (should (eq (key-binding (kbd key)) 'gptel-ui-links-open)))
+          (let (target)
+            (cl-letf (((symbol-function 'gptel-ui-links--visit)
+                       (lambda (value) (setq target value))))
+              (call-interactively (key-binding (kbd "C-c C-o")))
+              (should (equal target "src.el:9:4"))))
+          (gptel-ui-toggle-source)
+          (should (eq (key-binding (kbd "C-c C-o")) 'forward-char))
+          (local-unset-key (kbd "C-c C-o"))
+          (should-not (key-binding (kbd "C-c C-o"))))
+      (gptel-ui-mode -1))))
+
+(ert-deftest gptel-ui-links-org-multiline-edits-and-suffix-reuse ()
+  (require 'org)
+  (require 'gptel-ui)
+  (with-temp-buffer
+    (org-mode)
+    (dotimes (_ 1000) (insert "[[file:source.el][Source]]\n"))
+    (unwind-protect
+        (progn
+          (gptel-ui-mode 1)
+          (let ((suffix (point)))
+            (insert "[[*Destination][go\nhttps://label.test")
+            (should (= gptel-ui--link-dirty-start suffix))
+            (gptel-ui-refresh)
+            ;; Finishing, editing, breaking, and restoring the bracket link
+            ;; must give the same result as parsing the current text anew.
+            (dolist (change '("" "]]" edit break "]]"))
+              (pcase change
+                ('edit (backward-char 2) (insert "/edited") (forward-char 2))
+                ('break (delete-char -2))
+                ((pred stringp) (insert change)))
+              (let ((render (symbol-function 'gptel-ui-links-render))
+                    starts)
+                (cl-letf (((symbol-function 'gptel-ui-links-render)
+                           (lambda (start end &rest args)
+                             (push start starts)
+                             (apply render start end args))))
+                  (gptel-ui-refresh))
+                (unless (equal change "")
+                  (should (equal starts (list suffix)))))
+              (save-excursion
+                (goto-char suffix)
+                (search-forward "label")
+                (let ((cached (get-char-property (point) 'gptel-ui-link)))
+                  (should (equal (not cached) (or (equal change "]]") (eq change 'edit))))
+                  (gptel-ui--clear)
+                  (gptel-ui-refresh)
+                  (should (equal cached (get-char-property (point) 'gptel-ui-link))))))))
+      (gptel-ui-mode -1))))
+
+(ert-deftest gptel-ui-links-org-multiline-reuses-paragraph-bounds ()
+  (require 'org)
+  (require 'org-element)
+  (with-temp-buffer
+    (org-mode)
+    (dotimes (_ 64)
+      (insert "[[*Destination][multiline\nhttps://label.test]]\n"))
+    (let ((lookup (symbol-function 'org-element-at-point)) (calls 0))
+      (cl-letf (((symbol-function 'org-element-at-point)
+                 (lambda (&rest args) (cl-incf calls) (apply lookup args))))
+        (should-not (gptel-ui-links-render (point-min) (point-max))))
+      (should (= calls 1)))))
+
+(ert-deftest gptel-ui-links-org-incomplete-opener-respects-element-boundaries ()
+  (require 'org)
+  (with-temp-buffer
+    (org-mode)
+    (insert "[[*Missing][before a blank line\n\n"
+            "[[*Missing][before a heading\n* Title\n"
+            "Text https://visible.test ]]\n[[file:ok.org][File]]")
+    (should (equal (mapcar (lambda (ov) (overlay-get ov 'gptel-ui-link))
+                           (gptel-ui-links-render (point-min) (point-max)))
+                   '("https://visible.test" "file:ok.org")))))
+
+(ert-deftest gptel-ui-links-org-table-opens-native-and-file-destinations ()
+  (require 'org)
+  (require 'gptel-ui)
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (org-mode)
+      (insert "* Destination\n* Sender\n"
+              "| Reference |\n|-----------|\n"
+              "| [[*Destination][Jump]] |\n| [[file:source.el::9:2][Source]] |\n"
+              "| [[elisp:(ignore)][https://not-the-target.test]] |\n"
+              "| [[/ssh:outside:/path][Remote]] |\n")
+      (unwind-protect
+          (progn
+            (gptel-ui-mode 1)
+            (dolist (label '("Source" "Jump"))
+              (goto-char (point-min))
+              (search-forward "Reference")
+              (should (eq (key-binding (kbd "C-c C-o")) 'gptel-ui-links-open))
+              (let (visited)
+                (cl-letf (((symbol-function 'gptel-ui-links--visit)
+                           (lambda (target) (setq visited target)))
+                          ((symbol-function 'completing-read)
+                           (lambda (_prompt choices &rest _)
+                             (should (= (length choices) 2))
+                             (car (cl-find-if (lambda (c) (string-prefix-p label (car c)))
+                                              choices)))))
+                  (call-interactively (key-binding (kbd "C-c C-o")))
+                  (if (equal label "Source")
+                      (should (equal visited "file:source.el::9:2"))
+                    (should (= (line-number-at-pos) 1))))))
+            (gptel-ui-toggle-source)
+            (goto-char (point-min))
+            (search-forward "Jump")
+            (should (eq (key-binding (kbd "C-c C-o")) 'org-open-at-point)))
+        (gptel-ui-mode -1)))))
+
 (provide 'gptel-ui-links-test)
 ;;; gptel-ui-links-test.el ends here

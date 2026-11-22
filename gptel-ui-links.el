@@ -15,6 +15,12 @@
 (require 'url-util)
 (require 'project)
 
+(defvar org-link-bracket-re)
+(declare-function org-element-at-point "org-element" (&optional epom cached-only))
+(declare-function org-element-property "org-element-ast" (property node &optional dflt force-undefer))
+(declare-function org-element-type "org-element-ast" (element &optional anonymous))
+(declare-function org-link-open-from-string "ol" (s &optional arg))
+
 (defface gptel-ui-link
   '((t (:inherit link :underline t)))
   "Face for actionable chat references."
@@ -22,6 +28,7 @@
 
 (defvar gptel-ui-links-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-o") #'gptel-ui-links-open)
     (define-key map (kbd "RET") #'gptel-ui-links-open)
     (define-key map [mouse-1] #'gptel-ui-links-open)
     map)
@@ -93,6 +100,10 @@ Only HTTP(S) URLs and local file references are supported."
            (pulse-momentary-highlight-one-line (point)))))
       (_ (user-error "Unsupported chat link: %s" target)))))
 
+(defun gptel-ui-links--target-text (target)
+  "Return the display text for a chat or native Org table link TARGET."
+  (if (eq (car-safe target) 'org) (cdr target) target))
+
 (defun gptel-ui-links--table-target ()
   "Select a destination from the rendered table at point, if any."
   (let (choices seen)
@@ -104,13 +115,16 @@ Only HTTP(S) URLs and local file references are supported."
               (let* ((target (get-text-property position 'gptel-ui-link display))
                      (next (next-single-property-change
                             position 'gptel-ui-link display (length display))))
-                (when (and (stringp target) (not (member target seen)))
+                (when (and target (not (member target seen)))
                   (let ((label (string-trim
                                 (replace-regexp-in-string
                                  "[[:space:]\n]+" " "
                                  (substring-no-properties display position next)))))
                     (push target seen)
-                    (push (cons (format "%s  —  %s" label target) target) choices)))
+                    (push (cons (format "%s  —  %s" label
+                                        (gptel-ui-links--target-text target))
+                                target)
+                          choices)))
                 (setq position next)))))))
     (setq choices (nreverse choices))
     (cond ((null choices) nil)
@@ -135,7 +149,9 @@ From the keyboard, select among links when point is inside a rendered table."
                       thereis (overlay-get overlay 'gptel-ui-link))
              (and (not event) (gptel-ui-links--table-target)))))
       (unless target (user-error "No chat link at point"))
-      (gptel-ui-links--visit target))))
+      (if (eq (car-safe target) 'org)
+          (org-link-open-from-string (cdr target) current-prefix-arg)
+        (gptel-ui-links--visit target)))))
 
 (defun gptel-ui-links-string (label target)
   "Return clickable LABEL for TARGET for use in display strings."
@@ -144,7 +160,8 @@ From the keyboard, select among links when point is inside a rendered table."
               'face 'gptel-ui-link
               'mouse-face 'highlight
               'keymap gptel-ui-links-map
-              'help-echo (concat target "\nRET or click to open")))
+              'help-echo (concat (gptel-ui-links--target-text target)
+                                 "\nRET or click to open")))
 
 (defun gptel-ui-links--markdown-target (text)
   "Extract the destination from Markdown TEXT, ignoring an optional title."
@@ -190,12 +207,77 @@ RANGES is a vector of half-open (START . END) intervals."
           (setq hi mid))))
     (and (< lo (length ranges)) (< (car (aref ranges lo)) end))))
 
-(defun gptel-ui-links-render (start end &optional skip-p)
+(defun gptel-ui-links--org-chat-target-p (target destination)
+  "Whether Org TARGET can be opened using chat link DESTINATION."
+  (pcase (plist-get destination :type)
+    ('web (not (string-search "\\" target)))
+    ('file
+     ;; Org treats unqualified names as fuzzy links, even if they look
+     ;; like filenames.  Its non-numeric file search options also need Org.
+     (and (or (string-prefix-p "file:" target)
+              (file-name-absolute-p target)
+              (string-match-p "\\`\\.\\.?/" target))
+          (not (string-match-p "[\\\\\n]" target))
+          (not (string-search "::" (plist-get destination :path)))))))
+
+(defun gptel-ui-links--org-rescan-start (start)
+  "Return START or the line of an earlier possible Org bracket link opener."
+  (save-excursion
+    (goto-char start)
+    (let (opening)
+      ;; A label can contain a literal [[.  Look back to the last completed
+      ;; link or blank line once per refresh and retain the earliest opener.
+      (while (and (re-search-backward "\\[\\[\\|\\]\\]\\|^[ \t]*\n" nil t)
+                  (cond ((looking-at-p "\\[\\[") (setq opening (point)))
+                        ((eq (char-before) ?\\) t))))
+      (if opening (progn (goto-char opening) (line-beginning-position)) start))))
+
+(defun gptel-ui-links--org-contents-end (opening)
+  "Return the end of Org contents allowing multiline links at OPENING."
+  (save-match-data
+    (save-excursion
+      (goto-char opening)
+      (let ((element (org-element-at-point)))
+        (if (and (memq (org-element-type element) '(paragraph verse-block))
+                 (<= (org-element-property :contents-begin element) opening))
+            (org-element-property :contents-end element)
+          opening)))))
+
+(defun gptel-ui-links--org-brackets (end visit)
+  "Call VISIT with the match data for each Org bracket link up to END.
+Limit the native grammar to each run of nonblank lines.  Ask Org about
+multiline matches since descriptions cannot span element boundaries."
+  (while (search-forward "[[" end t)
+    (let* ((begin (- (point) 2))
+           (paragraph-end (if (re-search-forward "^[ \t]*\n" end t) (point) end))
+           (contents-end begin)
+           ;; A streamed paragraph may contain many incomplete openers.
+           (limit (save-excursion
+                    (goto-char paragraph-end)
+                    (when (search-backward "]]" begin t) (+ (point) 2)))))
+      (when limit
+        (goto-char begin)
+        (while (re-search-forward org-link-bracket-re limit t)
+          (let ((opening (match-beginning 0)))
+            (if (or (>= opening (line-beginning-position))
+                    (progn
+                      (when (<= contents-end opening)
+                        (setq contents-end (gptel-ui-links--org-contents-end opening)))
+                      (<= (match-end 0) contents-end)))
+                (funcall visit)
+              ;; A malformed opener can precede another, valid bracket link.
+              (goto-char (+ opening 2))))))
+      (goto-char paragraph-end))))
+
+(defun gptel-ui-links-render (start end &optional skip-p org-table-cell)
   "Return link overlays for START through END without changing text.
 SKIP-P, when non-nil, receives candidate start and end positions; a
-non-nil result excludes the link.  The caller owns the returned overlays."
+non-nil result excludes the link.  ORG-TABLE-CELL means rendering an Org
+cell in a temporary buffer, where native links need display actions.
+The caller owns the returned overlays."
   (save-excursion
-    (let (overlays ranges pending (index []))
+    (let ((org-links (or org-table-cell (derived-mode-p 'org-mode)))
+          overlays ranges pending (index []))
       (cl-labels
           ;; Each grammar pass visits nonoverlapping candidates in source
           ;; order.  Only earlier, higher-precedence passes need indexing.
@@ -209,38 +291,53 @@ non-nil result excludes the link.  The caller owns the returned overlays."
            (covered (begin finish)
              (or (and skip-p (funcall skip-p begin finish))
                  (gptel-ui-links--overlap-p begin finish index)))
-           (add-link (begin finish target &optional label existing-only)
+           (decorate (begin finish target label)
+             (let ((ov (make-overlay begin finish nil nil nil)))
+               (overlay-put ov 'gptel-ui-links t)
+               (overlay-put ov 'gptel-ui-link target)
+               (overlay-put ov 'face 'gptel-ui-link)
+               (overlay-put ov 'mouse-face 'highlight)
+               (overlay-put ov 'keymap gptel-ui-links-map)
+               (overlay-put ov 'help-echo (concat (gptel-ui-links--target-text target)
+                                                  "\nRET or click to open"))
+               (overlay-put ov 'priority 30)
+               (overlay-put ov 'evaporate t)
+               (when label (overlay-put ov 'display (gptel-ui-links-string label target)))
+               (push (cons begin finish) pending)
+               (push ov overlays)))
+           (add-link (begin finish target &optional label existing-only org-bracket)
              (unless (covered begin finish)
                (let* ((destination (gptel-ui-links--destination target))
                       (file (and existing-only
                                  (eq (plist-get destination :type) 'file)
                                  (gptel-ui-links--resolve
                                   (plist-get destination :path)))))
-                 (when (and destination
-                            (or (not existing-only)
-                                (and file (file-exists-p file))))
-                   (let ((ov (make-overlay begin finish nil nil nil)))
-                     (overlay-put ov 'gptel-ui-links t)
-                     (overlay-put ov 'gptel-ui-link target)
-                     (overlay-put ov 'face 'gptel-ui-link)
-                     (overlay-put ov 'mouse-face 'highlight)
-                     (overlay-put ov 'keymap gptel-ui-links-map)
-                     (overlay-put ov 'help-echo (concat target "\nRET or click to open"))
-                     (overlay-put ov 'priority 30)
-                     (overlay-put ov 'evaporate t)
-                     (when label
-                       (overlay-put ov 'display
-                                    (gptel-ui-links-string label target)))
-                     (push (cons begin finish) pending)
-                     (push ov overlays)))))))
+                 (cond
+                  ((and org-links org-bracket
+                        (not (gptel-ui-links--org-chat-target-p target destination)))
+                   ;; Keep unsupported protocols and remote references out
+                   ;; of the table chooser.  A custom ID starts with "#"
+                   ;; and intentionally has no chat destination.
+                   (if (and org-table-cell
+                            (or destination (string-prefix-p "#" target)))
+                       (decorate begin finish (cons 'org (concat "[[" target "]]")) label)
+                     ;; Keep Org's bindings and don't linkify its description.
+                     (push (cons begin finish) pending)))
+                  ((and destination
+                        (or (not existing-only) (and file (file-exists-p file))))
+                   (decorate begin finish target label)))))))
         ;; Org links first so their nested brackets cannot become Markdown links.
         (goto-char start)
-        (while (re-search-forward
-                "\\[\\[\\([^]\n]+\\)\\]\\(?:\\[\\([^]\n]*\\)\\]\\)?\\]" end t)
-          (add-link (match-beginning 0) (match-end 0)
-                    (match-string-no-properties 1)
-                    (or (match-string-no-properties 2)
-                        (match-string-no-properties 1))))
+        (let ((visit (lambda ()
+                       (add-link (match-beginning 0) (match-end 0)
+                                 (match-string-no-properties 1)
+                                 (or (match-string-no-properties 2)
+                                     (match-string-no-properties 1)) nil t))))
+          (if org-links
+              (gptel-ui-links--org-brackets end visit)
+            (while (re-search-forward
+                    "\\[\\[\\([^]\n]+\\)\\]\\(?:\\[\\([^]\n]*\\)\\]\\)?\\]" end t)
+              (funcall visit))))
         (next-pass)
         (goto-char start)
         (while (re-search-forward "\\[\\([^]\n]+\\)\\](" end t)

@@ -48,6 +48,41 @@
                     (should (equal-including-properties source (buffer-string))))
                 (when gptel-ui-mode (gptel-ui-mode -1))))))))))
 
+(ert-deftest gptel-ui-roles-newline-only-prefixes-use-native-role-boundaries ()
+  (dolist (prefixes '(("\n" "@assistant\n") ("@user\n" "\n") ("\n" "\n")
+                      ("\n\n" "\n\n")))
+    (ert-info ((format "Prefixes %S" prefixes))
+      (with-temp-buffer
+        (text-mode)
+        (let* ((prompt (car prefixes))
+               (response (cadr prefixes))
+               (gptel-prompt-prefix-alist (list (cons major-mode prompt)))
+               (gptel-response-prefix-alist (list (cons major-mode response)))
+               (skip (symbol-function 'gptel-ui--skip-p))
+               turns)
+          (dolist (_ '(first second))
+            (insert prompt)
+            (push (if (equal prompt "@user\n") (- (point) (length prompt)) (point)) turns)
+            (insert "Question\n\nMore detail\n\n" response)
+            (push (if (equal response "@assistant\n") (- (point) (length response)) (point)) turns)
+            (insert (propertize "Answer\n\nMore detail" 'gptel 'response) "\n\n"))
+          (setq turns (nreverse turns))
+          (let ((source (buffer-string)))
+            ;; Fail immediately if the role scan offers a zero-width match.
+            ;; Otherwise the buggy loop would never return control to ERT.
+            (cl-letf (((symbol-function 'gptel-ui--skip-p)
+                       (lambda (beg end) (should (< beg end)) (funcall skip beg end))))
+              (unwind-protect
+                  (progn
+                    (gptel-ui-mode 1)
+                    (should (equal gptel-ui--turns turns))
+                    (gptel-ui-toggle-source)
+                    (should-not gptel-ui--overlays)
+                    (gptel-ui-toggle-source)
+                    (should (equal gptel-ui--turns turns))
+                    (should (equal-including-properties source (buffer-string))))
+                (when gptel-ui-mode (gptel-ui-mode -1))))))))))
+
 (defun gptel-ui-roles-test--boundary-work (count response)
   "Count boundary lookup and predicate work for COUNT turns with RESPONSE.
 Counting visited candidates detects repeated transcript scans without relying

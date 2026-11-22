@@ -194,16 +194,18 @@ after changing this option."
 (defun gptel-ui--blocks ()
   "Give code, quotations and native tools distinct visual treatments."
   (goto-char (point-min))
-  (let ((case-fold-search t))
+  (let ((case-fold-search t) (role-end (point-min)))
     (while (re-search-forward
             "^[ \t]*\\(```+\\|~~~+\\|#\\+begin_\\([[:alnum:]_]+\\)\\)\\([^\n]*\\)$" nil t)
       (let* ((beg (line-beginning-position))
              (opening-end (line-end-position))
+             (fence-beg (match-beginning 1))
              (fence (match-string-no-properties 1))
              (kind (match-string-no-properties 2))
              (info (string-trim (match-string-no-properties 3)))
              (tool (or (equal (downcase (or kind "")) "tool")
                        (string-match-p "\\`tool\\b" info)))
+             (code (or (null kind) (member (downcase kind) '("src" "example"))))
              (closing (if kind
                           (concat "^[ \t]*#\\+end_" (regexp-quote kind) "[ \t]*$")
                         (format "^[ \t]*%s\\{%d,\\}[ \t]*$"
@@ -227,9 +229,19 @@ after changing this option."
                            (memq (get-text-property (point) 'gptel) '(nil ignore))
                            (looking-at closing))
                   (setq close-beg (point) end (match-end 0))))
-            (if (re-search-forward closing nil t)
-                (setq close-beg (line-beginning-position) end (line-end-position))
-              (setq end (point-max)))))
+            ;; Ordinary code belongs to the message that opened it.  Native
+            ;; wrappers (e.g. ignored Markdown reasoning fences) can straddle
+            ;; multiple roles.  Reuse the limit for blocks in the same run.
+            (let ((limit (point-max)))
+              (when (and code (memq (get-text-property fence-beg 'gptel)
+                                    '(nil response)))
+                (when (<= role-end fence-beg)
+                  (setq role-end (next-single-property-change
+                                  fence-beg 'gptel nil (point-max))))
+                (setq limit role-end))
+              (if (and (<= (point) limit) (re-search-forward closing limit t))
+                  (setq close-beg (line-beginning-position) end (line-end-position))
+                (setq end limit)))))
         (push (cons beg end) gptel-ui--excluded)
         (when tool
           (let ((decorations (gptel-ui-tools-render-block
@@ -255,7 +267,7 @@ after changing this option."
                body-beg (or close-beg end) 'face 'gptel-ui-quote
                'line-prefix rail 'wrap-prefix rail 'priority 2
                'gptel-ui-quotation t))))
-        (when (and (not tool) (or (null kind) (member (downcase kind) '("src" "example"))))
+        (when (and code (not tool))
           (gptel-ui--overlay beg end 'face 'gptel-ui-code 'priority 1)
           (gptel-ui--overlay
            beg opening-end 'face
@@ -297,9 +309,12 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
          'before-string (concat caption "\n\n") 'priority 30)))))
 
 (defun gptel-ui--prefix (response)
-  "Return this major mode's configured RESPONSE or prompt prefix."
-  (let ((var (if response 'gptel-response-prefix-alist 'gptel-prompt-prefix-alist)))
-    (and (boundp var) (alist-get major-mode (symbol-value var)))))
+  "Return this major mode's RESPONSE or prompt prefix if it labels a turn."
+  (let* ((var (if response 'gptel-response-prefix-alist 'gptel-prompt-prefix-alist))
+         (prefix (and (boundp var) (alist-get major-mode (symbol-value var)))))
+    ;; Newlines alone separate paragraphs too.  Use native role properties
+    ;; for these prefixes, just as for an empty prefix.
+    (and (stringp prefix) (string-match-p "[^\n]" prefix) prefix)))
 
 (defun gptel-ui--roles ()
   "Label each assistant turn once, including its tools and final response."
@@ -313,7 +328,7 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
     ;; Gather boundaries first, then read them in transcript order.  A tool
     ;; result interrupts the response text property, not the speaker's turn.
     (dolist (spec (list (cons prompt nil) (cons response t)))
-      (when (and (stringp (car spec)) (not (string-empty-p (car spec))))
+      (when (car spec)
         (goto-char (point-min))
         (while (re-search-forward
                 (concat "^" (regexp-quote (string-remove-suffix "\n" (car spec)))
@@ -337,7 +352,7 @@ PREFIX means an existing prefix is replaced, otherwise insert a caption."
                 (push (list beg beg 'assistant) events)))))
         ;; Empty prompt prefixes are supported by gptel too.  In that case
         ;; ordinary untagged prose is the only available user boundary.
-        (when (and (or (null prompt) (string-empty-p prompt))
+        (when (and (null prompt)
                    (null (get-text-property pos 'gptel)))
           (save-excursion
             (goto-char pos)
@@ -700,7 +715,10 @@ prefix only when its exclusions and workspace are unchanged."
                  ((or force (null gptel-ui--link-cache)
                       (not (equal default-directory (nth 1 gptel-ui--link-cache))))
                   (point-min))
-                 (gptel-ui--link-dirty-start)
+                 (gptel-ui--link-dirty-start
+                  (if (derived-mode-p 'org-mode)
+                      (gptel-ui-links--org-rescan-start gptel-ui--link-dirty-start)
+                    gptel-ui--link-dirty-start))
                  ;; Silent property restoration bypasses after-change hooks.
                  ((/= tick (car gptel-ui--link-cache)) (point-min))
                  (t (point-max)))))
@@ -864,7 +882,6 @@ their local observer already handles it, even if they exclude global hooks."
     (define-key map (kbd "C-c C-p") #'gptel-ui-previous-turn)
     (define-key map (kbd "C-c ]") #'gptel-ui-next-approval)
     (define-key map (kbd "C-c [") #'gptel-ui-previous-approval)
-    (define-key map (kbd "C-c C-o") #'gptel-ui-links-open)
     map))
 
 (defun gptel-ui--cleanup ()

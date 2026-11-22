@@ -2,8 +2,8 @@
 
 ;;; Commentary:
 ;; Run separately with real gptel and markdown-mode on load-path.  These tests
-;; exercise native headers, mode lifecycle, folding and pending tool controls
-;; without sending a request or loading the runner.
+;; exercise native chat rendering, commands and pending tool controls.
+;; The streaming test uses an in-process mock transport.
 
 ;;; Code:
 
@@ -566,6 +566,57 @@
                         (lambda (ov) (and (>= (overlay-start ov) answer)
                                          (eq (overlay-get ov 'face) 'gptel-ui-heading)))
                         gptel-ui--overlays))))))))
+
+(ert-deftest gptel-ui-integration-navigate-after-aborted-stream ()
+  (require 'gptel-openai)
+  (with-temp-buffer
+    (markdown-mode)
+    (gptel-mode 1)
+    (let* ((gptel--known-backends nil)
+           (gptel-backend (gptel-make-openai "UI fixture" :key "unused" :stream t))
+           (gptel-model 'gpt-4o)
+           (gptel-stream t)
+           (gptel-use-curl t)
+           (gptel-prompt-transform-functions nil)
+           (gptel--request-alist nil)
+           (gptel-prompt-prefix-alist '((markdown-mode . "### ")))
+           (gptel-response-prefix-alist '((markdown-mode . "")))
+           machine)
+      ;; Capture the request at the transport boundary.  The stream callback,
+      ;; abort command, role properties and follow-up prompt are all native.
+      (cl-letf (((symbol-function 'gptel-curl-get-response)
+                 (lambda (fsm)
+                   (setq machine fsm)
+                   (plist-put (gptel-fsm-info fsm) :callback
+                              #'gptel-curl--stream-insert-response)
+                   (push (cons 'fixture (cons fsm #'ignore)) gptel--request-alist))))
+        (cl-flet ((send-chunk (text)
+                    (gptel-send)
+                    (gptel--fsm-transition machine)
+                    (let ((info (gptel-fsm-info machine)))
+                      (funcall (plist-get info :callback) text info))))
+          (insert (gptel-prompt-prefix-string) "Show an example.")
+          (gptel-ui-mode 1)
+          (send-chunk "```elisp\n(+ 1")
+          (gptel-abort (current-buffer))
+          (should (eq (gptel-fsm-state machine) 'ABRT))
+          (goto-char (point-max))
+          (insert "\n")
+          (let ((follow-up (point)))
+            (insert (gptel-prompt-prefix-string) "Show the docs.")
+            (send-chunk "[Manual](https://example.org/manual)")
+            (gptel--fsm-transition machine)
+            (should (eq (gptel-fsm-state machine) 'DONE))
+            (gptel-ui-refresh)
+            (goto-char (point-min))
+            (search-forward "(+ 1")
+            (call-interactively (key-binding (kbd "C-c C-n")))
+            (should (= (point) follow-up))
+            (call-interactively (key-binding (kbd "C-c C-n")))
+            (should (equal (get-char-property (point) 'gptel-ui-link)
+                           "https://example.org/manual"))
+            (call-interactively (key-binding (kbd "C-c C-p")))
+            (should (= (point) follow-up))))))))
 
 (provide 'gptel-ui-integration-test)
 ;;; gptel-ui-integration-test.el ends here
