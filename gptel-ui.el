@@ -203,9 +203,25 @@ after changing this option."
              (body-beg (min (point-max) (1+ opening-end)))
              close-beg end)
         (forward-line 1)
-        (if (re-search-forward closing nil t)
-            (setq close-beg (line-beginning-position) end (line-end-position))
-          (setq end (point-max)))
+        (let ((role (get-text-property body-beg 'gptel)))
+          (if (and tool (eq (car-safe role) 'tool))
+              (progn
+                ;; Native results can contain arbitrary fences.  Their role
+                ;; boundary, not a fence in the output, ends the tool body.
+                (while (and (< (point) (point-max))
+                            (equal (get-text-property (point) 'gptel) role))
+                  (goto-char (next-single-property-change
+                              (point) 'gptel nil (point-max))))
+                (setq end (point))
+                ;; gptel puts this separator newline outside the tool role.
+                (when (eq (char-after) ?\n) (forward-char))
+                (when (and (bolp)
+                           (memq (get-text-property (point) 'gptel) '(nil ignore))
+                           (looking-at closing))
+                  (setq close-beg (point) end (match-end 0))))
+            (if (re-search-forward closing nil t)
+                (setq close-beg (line-beginning-position) end (line-end-position))
+              (setq end (point-max)))))
         (push (cons beg end) gptel-ui--excluded)
         (when tool
           (let ((decorations (gptel-ui-tools-render-block

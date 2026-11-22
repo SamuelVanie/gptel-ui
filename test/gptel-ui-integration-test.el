@@ -291,5 +291,91 @@
             (when gptel-mode (gptel-mode -1)))
           (kill-buffer buffer))))))
 
+(ert-deftest gptel-ui-integration-native-tool-result-nested-fences ()
+  (dolist (mode '(markdown-mode org-mode))
+    (gptel-ui-integration-test--chat mode
+      (let* ((gptel-include-tool-results t)
+             (tool (gptel-make-tool :name "UIIntegrationRead"
+                                    :description "Read a fixture"
+                                    :function #'ignore :args nil))
+             (info (list :buffer (current-buffer) :position (point-marker)
+                         :callback #'gptel--insert-response
+                         :tool-use '((:name "UIIntegrationRead" :id "read-1")))))
+        ;; Use native insertion, including its wrappers, role properties and
+        ;; Org escaping.  No tool function or request is executed.
+        (gptel--display-tool-results
+         (list (list tool '("README.md")
+                     "Example:\n```elisp\n(message \"hello\")\n```\n#+end_tool\nMore file content"))
+         info)
+        (goto-char (point-max))
+        (let ((tool-beg (save-excursion
+                          (goto-char (point-min))
+                          (skip-chars-forward "\n")
+                          (point)))
+              (tool-end (1- (point))) (answer (point)))
+          (insert (propertize
+                   (if (eq mode 'org-mode)
+                       "\n* Summary\n[[https://example.com/result][Result]]\n"
+                     "\n# Summary\n[Result](https://example.com/result)\n")
+                   'gptel 'response))
+          (let ((source (buffer-string))
+                (native-overlays
+                 (mapcar (lambda (ov) (list ov (overlay-start ov) (overlay-end ov)
+                                           (overlay-properties ov)))
+                         (overlays-in (point-min) (point-max)))))
+            (gptel-ui-mode 1)
+            (should (equal gptel-ui--excluded (list (cons tool-beg tool-end))))
+            (should (= 1 (length gptel-ui--tool-starts)))
+            (should-not (gptel-ui--excluded-p answer (point-max)))
+            (should-not (cl-some (lambda (ov) (eq (overlay-get ov 'face) 'gptel-ui-code))
+                                gptel-ui--overlays))
+            (should (= 1 (cl-count-if
+                          (lambda (ov) (eq (overlay-get ov 'face) 'gptel-ui-heading))
+                          gptel-ui--overlays)))
+            (should (= 1 (cl-count-if (lambda (ov) (overlay-get ov 'gptel-ui-link))
+                                    gptel-ui--overlays)))
+            (should (equal-including-properties source (buffer-string)))
+            (dolist (entry native-overlays)
+              (let ((ov (car entry)))
+                (should (equal (cdr entry)
+                               (list (overlay-start ov) (overlay-end ov)
+                                     (overlay-properties ov))))))))))))
+
+(ert-deftest gptel-ui-integration-consecutive-tool-results-before-assistant ()
+  (dolist (prefix '("[Result](https://example.com/result)\n"
+                    "````text\n```\n[Literal](https://example.com/literal)\n````\n"))
+    (gptel-ui-integration-test--chat #'markdown-mode
+      (let* ((gptel-include-tool-results t)
+             (tool (gptel-make-tool :name "UIIntegrationRead"
+                                    :description "Read a fixture"
+                                    :function #'ignore :args nil))
+             (info (list :buffer (current-buffer) :position (point-marker)
+                         :callback #'gptel--insert-response
+                         :tool-use '((:name "UIIntegrationRead" :id "read-1"))))
+             (code (string-prefix-p "````" prefix)))
+        (gptel--display-tool-results
+         (list (list tool '("first.md") "First:\n```elisp\n(+ 1 2)\n```\nTail")
+               (list tool '("second.md") "Second:\n````text\n```\n````\nTail"))
+         info)
+        (goto-char (point-max))
+        (let ((answer (point)))
+          (insert (propertize (concat prefix "\n# Summary\n"
+                                     (when code "[Result](https://example.com/result)\n"))
+                              'gptel 'response))
+          (gptel-ui-mode 1)
+          (should (= 2 (length gptel-ui--tool-starts)))
+          (should (= (if code 3 2) (length gptel-ui--excluded)))
+          (should (= (if code 1 0)
+                     (cl-count-if (lambda (ov) (eq (overlay-get ov 'face) 'gptel-ui-code))
+                                  gptel-ui--overlays)))
+          (should (= 1 (cl-count-if
+                        (lambda (ov) (and (>= (overlay-start ov) answer)
+                                         (overlay-get ov 'gptel-ui-link)))
+                        gptel-ui--overlays)))
+          (should (= 1 (cl-count-if
+                        (lambda (ov) (and (>= (overlay-start ov) answer)
+                                         (eq (overlay-get ov 'face) 'gptel-ui-heading)))
+                        gptel-ui--overlays))))))))
+
 (provide 'gptel-ui-integration-test)
 ;;; gptel-ui-integration-test.el ends here
