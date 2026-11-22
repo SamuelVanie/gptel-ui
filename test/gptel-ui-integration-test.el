@@ -364,6 +364,123 @@
             (when gptel-mode (gptel-mode -1)))
           (kill-buffer buffer))))))
 
+(defun gptel-ui-integration-test--approval-navigation (keys command &optional inspect)
+  "Run native approval COMMAND via KEYS, optionally from INSPECT, then cycle."
+  (let ((gptel-mode-hook nil)
+        (gptel--known-tools (copy-tree gptel--known-tools))
+        (gptel-ui-global-mode nil)
+        (gptel-display-buffer-action '(display-buffer-same-window))
+        (gptel-ui-refresh-delay 3600)
+        (overriding-terminal-local-map nil)
+        (pre-command-hook nil)
+        (parent (generate-new-buffer " *ui-navigation-parent*"))
+        (workers (list (generate-new-buffer " *ui-navigation-worker-a*")
+                       (generate-new-buffer " *ui-navigation-worker-b*")))
+        (original-set-transient-map (symbol-function 'set-transient-map))
+        (installed 0)
+        (executed 0)
+        (completed 0)
+        remembered exit-function)
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'gptel-request)
+                     (lambda (&rest _) (ert-fail "Unexpected model request")))
+                    ((symbol-function 'set-transient-map)
+                     (lambda (&rest args)
+                       (cl-incf installed)
+                       (setq exit-function (apply original-set-transient-map args)))))
+            (switch-to-buffer parent)
+            (text-mode)
+            (gptel-mode 1)
+            (gptel-ui-mode 1)
+            (dolist (worker workers)
+              (with-current-buffer worker
+                (text-mode)
+                (insert (propertize "Inspecting the project.\n\n" 'gptel 'response))
+                (let* ((tool (gptel-make-tool
+                              :name "UIApprovalNavigation"
+                              :description "Record a fixture approval"
+                              :function (lambda ()
+                                          (cl-incf executed)
+                                          (setq remembered
+                                                (bound-and-true-p
+                                                 gptel-agent-access--remember))
+                                          "done")
+                              :args nil))
+                       (info (list :position (point-marker)
+                                   :backend (gptel--make-backend :name "UI integration")
+                                   :tool-use '((:name "UIApprovalNavigation" :args nil)))))
+                  (gptel--display-tool-calls
+                   (list (list tool nil (lambda (_) (cl-incf completed)))) info))))
+            ;; Use the command loop: calling commands directly skips the
+            ;; transient map's pre-command lifetime check.
+            (execute-kbd-macro (kbd "C-c ]"))
+            (should (eq (current-buffer) (car workers)))
+            (should-not gptel-ui-mode)
+            (should (= executed 0))
+            (when inspect
+              (should (eq (key-binding (kbd "C-c C-i")) #'gptel--inspect-tool-calls))
+              (execute-kbd-macro (kbd "C-c C-i"))
+              (should (equal (buffer-name) "*gptel-tool-calls*"))
+              ;; The inspection copies must not enter the approval queue.
+              (should (= (length (gptel-ui-tools-pending-approvals)) 2)))
+            (should (eq (key-binding (kbd keys)) command))
+            (if (memq command '(gptel--steer-tool-calls gptel--inspect-steer-tool-calls))
+                ;; Exercise real minibuffer input inside the native command.
+                (let ((noninteractive nil))
+                  (execute-kbd-macro (vconcat (kbd keys) "Try again" (kbd "RET"))))
+              (execute-kbd-macro (kbd keys)))
+            (should (eq (current-buffer) (car workers)))
+            (should (= executed (if (memq command '(gptel--inspect-accept-tool-calls
+                                                    gptel-agent-allow-outside-access))
+                                    1 0)))
+            (should (= completed (if (memq command '(gptel--inspect-quit-tool-calls
+                                                     gptel--inspect-reject-tool-calls))
+                                     0 1)))
+            (when (eq command 'gptel-agent-allow-outside-access)
+              (should remembered))
+            (should (= (length (gptel-ui-tools-pending-approvals))
+                       (if (eq command 'gptel--inspect-quit-tool-calls) 2 1)))
+            (should (eq (key-binding (kbd "C-c ]")) #'gptel-ui-next-approval))
+            (should (eq (key-binding (kbd "C-c [")) #'gptel-ui-previous-approval))
+            (execute-kbd-macro (kbd "C-c ]"))
+            (should (eq (current-buffer) (cadr workers)))
+            (execute-kbd-macro (kbd "C-c ["))
+            (should (eq (current-buffer)
+                        (if (eq command 'gptel--inspect-quit-tool-calls)
+                            (car workers) (cadr workers))))
+            (should (= installed 1))
+            (should (eq (key-binding (kbd "C-c C-c")) #'gptel--accept-tool-calls))
+            (should (eq (key-binding (kbd "C-c C-k")) #'gptel--reject-tool-calls))
+            ;; Ordinary movement still ends the temporary navigation session.
+            (execute-kbd-macro (kbd "C-f"))
+            (should-not (eq (key-binding (kbd "C-c ]")) #'gptel-ui-next-approval))
+            (should-not (eq (key-binding (kbd "C-c [")) #'gptel-ui-previous-approval))))
+      (when exit-function (funcall exit-function))
+      (dolist (buffer (append (list parent (get-buffer "*gptel-tool-calls*")) workers))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (when gptel-ui-mode (gptel-ui-mode -1))
+            (when gptel-mode (gptel-mode -1)))
+          (kill-buffer buffer))))))
+
+(ert-deftest gptel-ui-integration-navigation-survives-inspection-actions ()
+  (dolist (action '(("C-c C-i" gptel--inspect-quit-tool-calls)
+                    ("C-c C-c" gptel--inspect-accept-tool-calls)
+                    ("C-c C-k" gptel--inspect-reject-tool-calls)
+                    ("C-c C-r" gptel--inspect-steer-tool-calls)))
+    (ert-info ((format "Inspection action %s" (cadr action)))
+      (gptel-ui-integration-test--approval-navigation (car action) (cadr action) t))))
+
+(ert-deftest gptel-ui-integration-navigation-survives-steering-input ()
+  (gptel-ui-integration-test--approval-navigation "C-c C-r" #'gptel--steer-tool-calls))
+
+(ert-deftest gptel-ui-integration-navigation-survives-outside-access ()
+  ;; gptel-agent is optional; the core integration suite needs only gptel.
+  (skip-unless (require 'gptel-agent-access nil t))
+  (gptel-ui-integration-test--approval-navigation
+   "C-c C-a" #'gptel-agent-allow-outside-access))
+
 (ert-deftest gptel-ui-integration-native-tool-result-nested-fences ()
   (dolist (mode '(markdown-mode org-mode))
     (gptel-ui-integration-test--chat mode
