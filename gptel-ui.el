@@ -113,6 +113,8 @@ after changing this option."
 (defvar-local gptel-ui--native-header nil)
 (defvar-local gptel-ui--installed-header nil)
 (defvar-local gptel-ui--clone-state nil)
+(defvar gptel-ui--text-views (make-hash-table :test #'eq)
+  "Enabled presentation buffers indexed by their shared base buffer.")
 (defvar gptel-ui--approval-cache nil)
 (defvar gptel-ui--approval-cache-dirty t)
 (defvar gptel-ui--watching-approvals nil)
@@ -760,7 +762,7 @@ Interactively, also recheck unchanged links for local file availability."
           (setq gptel-ui--turns (sort (delete-dups gptel-ui--turns) #'<)))))))
 
 (defun gptel-ui--schedule (&optional beg end old-length)
-  "Coalesce streaming and editing changes into one display refresh.
+  "Coalesce changes into one display refresh in the current view.
 BEG, END and OLD-LENGTH identify an `after-change-functions' notification."
   (when (and gptel-ui-mode (integerp beg) (integerp end) (integerp old-length))
     (save-match-data
@@ -776,6 +778,57 @@ BEG, END and OLD-LENGTH identify an `after-change-functions' notification."
                          (when (buffer-live-p buffer)
                            (with-current-buffer buffer (gptel-ui-refresh))))
                        (current-buffer)))))
+
+(defun gptel-ui--text-changed (beg end old-length)
+  "Invalidate enabled views sharing the text changed at BEG through END.
+OLD-LENGTH is the replaced length from `after-change-functions'."
+  ;; A global hook also observes edits through a base or indirect buffer
+  ;; where the UI is disabled.  Look up only this text's views; never scan
+  ;; all buffers or render synchronously for each streamed token.
+  (dolist (view (gethash (or (buffer-base-buffer) (current-buffer))
+                        gptel-ui--text-views))
+    (when (buffer-live-p view)
+      (with-current-buffer view
+        (gptel-ui--schedule beg end old-length)))))
+
+(defun gptel-ui--other-text-changed (beg end old-length)
+  "Forward changes from buffers without a local UI text observer.
+BEG, END and OLD-LENGTH describe the change.  Skip enabled views because
+their local observer already handles it, even if they exclude global hooks."
+  (unless (memq #'gptel-ui--text-changed after-change-functions)
+    (gptel-ui--text-changed beg end old-length)))
+
+(defun gptel-ui--watch-text ()
+  "Register the current view for shared-text change notifications."
+  (let ((base (or (buffer-base-buffer) (current-buffer))))
+    (cl-pushnew (current-buffer) (gethash base gptel-ui--text-views)))
+  (add-hook 'after-change-functions #'gptel-ui--text-changed nil t)
+  ;; `add-hook' treats local lists without t as local even with LOCAL nil.
+  ;; Access the default explicitly to keep the fallback genuinely global.
+  (cl-pushnew #'gptel-ui--other-text-changed (default-value 'after-change-functions)))
+
+(defun gptel-ui--unwatch-text ()
+  "Unregister the current view and release unneeded text observers."
+  (let* ((base (or (buffer-base-buffer) (current-buffer)))
+         (views (delq (current-buffer) (gethash base gptel-ui--text-views))))
+    (if views
+        (progn
+          (puthash base views gptel-ui--text-views)
+          ;; Disabled editors that exclude global hooks still need their
+          ;; local observer until the last related presentation closes.
+          (when (memq t after-change-functions)
+            (remove-hook 'after-change-functions #'gptel-ui--text-changed t)))
+      (remhash base gptel-ui--text-views)
+      ;; Discover retained observers only at group teardown, never on edits.
+      ;; This also covers indirect clones made from a disabled editor.
+      (dolist (buffer (buffer-list))
+        (when (eq (or (buffer-base-buffer buffer) buffer) base)
+          (with-current-buffer buffer
+            (remove-hook 'after-change-functions #'gptel-ui--text-changed t))))))
+  (when (zerop (hash-table-count gptel-ui--text-views))
+    (set-default 'after-change-functions
+                 (remq #'gptel-ui--other-text-changed
+                       (default-value 'after-change-functions)))))
 
 (defun gptel-ui--window-change (&optional frame)
   "Schedule a responsive table layout in windows of FRAME."
@@ -816,6 +869,7 @@ BEG, END and OLD-LENGTH identify an `after-change-functions' notification."
 
 (defun gptel-ui--cleanup ()
   "Cancel the pending renderer and remove decorations."
+  (gptel-ui--unwatch-text)
   (when (timerp gptel-ui--timer) (cancel-timer gptel-ui--timer))
   (setq gptel-ui--timer nil)
   (gptel-ui--clear)
@@ -847,7 +901,7 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
         (when gptel-ui--highlight-was-on (gptel-highlight-mode -1))
         (add-function :around (local 'filter-buffer-substring-function)
                       #'gptel-ui--filter-copy)
-        (add-hook 'after-change-functions #'gptel-ui--schedule nil t)
+        (gptel-ui--watch-text)
         (add-hook 'gptel-post-stream-hook #'gptel-ui--schedule nil t)
         (add-hook 'gptel-post-response-functions #'gptel-ui--schedule nil t)
         (add-hook 'kill-buffer-hook #'gptel-ui--cleanup nil t)
@@ -860,7 +914,6 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
     (gptel-ui--restore-header-status)
     (gptel-ui--cleanup)
     (remove-function (local 'filter-buffer-substring-function) #'gptel-ui--filter-copy)
-    (remove-hook 'after-change-functions #'gptel-ui--schedule t)
     (remove-hook 'gptel-post-stream-hook #'gptel-ui--schedule t)
     (remove-hook 'gptel-post-response-functions #'gptel-ui--schedule t)
     (remove-hook 'kill-buffer-hook #'gptel-ui--cleanup t)
@@ -885,6 +938,14 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
 
 (defun gptel-ui--clone ()
   "Detach a cloned conversation from its source's presentation ownership."
+  ;; A disabled editor can retain an observer for another indirect view.
+  ;; Ordinary clones have independent text and must not inherit that hook.
+  (when (and (not gptel-ui-mode)
+             (local-variable-p 'after-change-functions)
+             (memq #'gptel-ui--text-changed after-change-functions))
+    (setq-local after-change-functions (copy-sequence after-change-functions))
+    (unless (gethash (or (buffer-base-buffer) (current-buffer)) gptel-ui--text-views)
+      (remove-hook 'after-change-functions #'gptel-ui--text-changed t)))
   (when gptel-ui-mode
     (let ((saved gptel-ui--saved)
           (header (nth 2 (assq 'header-line-format gptel-ui--saved))))
@@ -896,6 +957,17 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
       (when (and gptel-ui--native-header
                  (eq header-line-format gptel-ui--installed-header))
         (setf (nth 1 header) (nth 1 header-line-format)))
+      ;; Emacs also copies overlays into indirect clones, but the copied
+      ;; ownership list still points at the source's originals.  Remove only
+      ;; our decorations in this buffer before rebuilding its presentation.
+      ;; Otherwise an untracked table copy can keep hiding subsequent prose.
+      (let ((overlays (overlay-lists)))
+        (dolist (overlay (append (car overlays) (cdr overlays)))
+          (when (or (overlay-get overlay 'gptel-ui)
+                    (overlay-get overlay 'gptel-ui-links)
+                    (overlay-get overlay 'gptel-ui-tables)
+                    (overlay-get overlay 'gptel-ui-tool))
+            (delete-overlay overlay))))
       ;; These locals were copied by reference.  Do not disable the mode or
       ;; run its cleanup before dropping the source's overlays and timer.
       (setq gptel-ui-mode nil
