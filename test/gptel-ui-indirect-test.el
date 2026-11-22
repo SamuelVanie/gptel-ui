@@ -279,6 +279,11 @@
         (gptel-ui-mode -1))
       (should (equal after-change-functions '(ignore))))))
 
+(defun gptel-ui-indirect-test--other-change-hooks (buffer)
+  "Snapshot BUFFER's change hooks owned by other packages."
+  (with-current-buffer buffer
+    (remq #'gptel-ui--text-changed (copy-sequence after-change-functions))))
+
 (ert-deftest gptel-ui-indirect-disabled-local-hooks-still-notify-views ()
   (dolist (origin '(base clone))
     (dolist (teardown '(disable kill))
@@ -292,7 +297,12 @@
                 (gptel-ui-mode 1)
                 (setq clone (clone-indirect-buffer " *ui-disabled-hooks*" nil))
                 (let ((editor (if (eq origin 'base) base clone))
-                      (view (if (eq origin 'base) clone base)))
+                      (view (if (eq origin 'base) clone base))
+                      ;; Agent session mode adds its own indirect-buffer hook.
+                      (hooks (mapcar
+                              (lambda (buffer)
+                                (cons buffer (gptel-ui-indirect-test--other-change-hooks buffer)))
+                              (list base clone))))
                   (with-current-buffer editor (gptel-ui-mode -1))
                   (with-current-buffer view (gptel-ui-refresh))
                   (with-current-buffer editor
@@ -306,7 +316,8 @@
                   (dolist (buffer (list base clone))
                     (when (buffer-live-p buffer)
                       (with-current-buffer buffer
-                        (should (equal after-change-functions '(ignore))))))))
+                        (should (equal after-change-functions
+                                       (cdr (assq buffer hooks)))))))))
             (when (buffer-live-p clone) (kill-buffer clone))
             (when (buffer-live-p base)
               (with-current-buffer base (gptel-ui-mode -1)))))))))
@@ -316,7 +327,7 @@
     (setq-local after-change-functions '(ignore))
     (let ((base (current-buffer))
           (gptel-ui-refresh-delay 3600)
-          view shared independent)
+          view shared independent hooks)
       (unwind-protect
           (progn
             (gptel-ui-mode 1)
@@ -324,9 +335,14 @@
             (gptel-ui-mode -1)
             (setq shared (clone-indirect-buffer " *ui-observer-shared*" nil)
                   independent (clone-buffer " *ui-observer-independent*" nil))
+            (setq hooks (mapcar
+                         (lambda (buffer)
+                           (cons buffer (gptel-ui-indirect-test--other-change-hooks buffer)))
+                         (list base shared independent)))
             (with-current-buffer independent
               (should-not gptel-ui-mode)
-              (should (equal after-change-functions '(ignore))))
+              (should (memq #'ignore after-change-functions))
+              (should-not (memq #'gptel-ui--text-changed after-change-functions)))
             (dolist (editor (list base shared))
               (with-current-buffer view (gptel-ui-refresh))
               (with-current-buffer editor (insert "[link](https://example.com/new)\n"))
@@ -334,7 +350,7 @@
             (kill-buffer view)
             (dolist (editor (list base shared independent))
               (with-current-buffer editor
-                (should (equal after-change-functions '(ignore))))))
+                (should (equal after-change-functions (cdr (assq editor hooks)))))))
         (dolist (buffer (list independent shared view))
           (when (buffer-live-p buffer) (kill-buffer buffer)))
         (when (buffer-live-p base) (gptel-ui-mode -1))))))
