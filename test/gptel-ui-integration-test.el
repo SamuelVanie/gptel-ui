@@ -116,6 +116,54 @@
       (should-not gptel-ui--timer)
       (gptel-highlight-mode -1))))
 
+(ert-deftest gptel-ui-integration-inline-prompt-keeps-its-controls ()
+  (skip-unless (require 'gptel-inline nil t))
+  (dolist (global-first '(t nil))
+    (ert-info ((format "Global mode enabled %s prompt creation"
+                       (if global-first "before" "after")))
+      (let ((gptel-mode-hook '(gptel-highlight-mode))
+            (gptel-ui-global-mode nil)
+            (gptel-default-mode 'markdown-mode)
+            (gptel-backend (gptel--make-backend :name "Fixture" :models '(fixture)))
+            (gptel-model 'fixture)
+            (gptel-use-header-line t)
+            (gptel-highlight-methods '(face))
+            (gptel-ui-header-details nil)
+            (chat-name (generate-new-buffer-name " *ui-inline-chat*")))
+        (unwind-protect
+            (save-window-excursion
+              (with-temp-buffer
+                (switch-to-buffer (current-buffer))
+                (when global-first (gptel-ui-global-mode 1))
+                ;; The real command creates the chat, clones it, and only
+                ;; then installs the prompt's keymap, header and context.
+                (let* ((prompt (gptel-inline nil chat-name))
+                       (chat (get-buffer chat-name))
+                       (prompt-header header-line-format))
+                  (should (eq (current-buffer) prompt))
+                  (unless global-first (gptel-ui-global-mode 1))
+                  (should (buffer-local-value 'gptel-ui-mode chat))
+                  (should (eq (buffer-base-buffer) chat))
+                  (should (buffer-narrowed-p))
+                  (should-not gptel-ui-mode)
+                  (should gptel-highlight-mode)
+                  (should (eq header-line-format prompt-header))
+                  (should (nth 2 header-line-format))
+                  (should (eq (key-binding (kbd "C-c C-v")) #'gptel-inline-visit-buffer))
+                  (should (eq (key-binding (kbd "C-c RET")) #'gptel-inline-send))
+                  (should-not gptel-ui--timer)
+                  (should-not (memq #'gptel-ui--schedule gptel-post-stream-hook))
+                  (insert "Inline question")
+                  (gptel-inline-append)
+                  (should-not (buffer-live-p prompt))
+                  (with-current-buffer chat
+                    (should gptel-ui-mode)
+                    (should (eq (key-binding (kbd "C-c C-v")) #'gptel-ui-toggle-source))
+                    (should (string-suffix-p "Inline question" (buffer-string)))))))
+          (gptel-ui-global-mode -1)
+          ;; Killing the base also cleans up a partially constructed prompt.
+          (when (get-buffer chat-name) (kill-buffer chat-name)))))))
+
 (ert-deftest gptel-ui-integration-native-tool-folds-remain-operable ()
   (dolist (mode '(org-mode markdown-mode))
     (gptel-ui-integration-test--chat mode

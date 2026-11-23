@@ -20,8 +20,10 @@ Put this repository on `load-path` and enable the view:
 (gptel-ui-global-mode 1)
 ```
 
-The global mode follows existing and future gptel conversations. Use
-`M-x gptel-ui-mode` to enable it in a single buffer, or
+The global mode follows existing and future gptel conversations. When using
+`gptel-inline`, the backing chat gets the reading view and the inline prompt
+keeps its own header and key bindings. Use `M-x gptel-ui-mode` to enable
+the view in a single buffer, or
 `M-x gptel-ui-demo` to preview the appearance without a model request.
 
 ## Reading and navigation
@@ -134,4 +136,5 @@ make integration-test INTEGRATION_LOAD_PATH="-L /path/to/gptel -L /path/to/markd
 ```
 
 These tests check native status updates, tool folds, approval controls, and
-mode lifecycle without sending model requests.
+mode lifecycle without sending model requests. Add `-L /path/to/gptel-inline`
+to the integration load path to exercise inline prompt creation and editing.

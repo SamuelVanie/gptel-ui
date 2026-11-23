@@ -113,6 +113,8 @@ after changing this option."
 (defvar-local gptel-ui--native-header nil)
 (defvar-local gptel-ui--installed-header nil)
 (defvar-local gptel-ui--clone-state nil)
+(defvar gptel-ui--creating-inline-prompt nil
+  "Non-nil while `gptel-inline' creates its indirect prompt buffer.")
 (defvar gptel-ui--text-views (make-hash-table :test #'eq)
   "Enabled presentation buffers indexed by their shared base buffer.")
 (defvar gptel-ui--approval-cache nil)
@@ -898,6 +900,13 @@ their local observer already handles it, even if they exclude global hooks."
     (remove-hook 'window-size-change-functions #'gptel-ui--window-change)
     (remove-hook 'window-configuration-change-hook #'gptel-ui--window-change)))
 
+(defun gptel-ui--remove-local-hooks ()
+  "Remove the reading view's response and lifecycle hooks."
+  (remove-hook 'gptel-post-stream-hook #'gptel-ui--schedule t)
+  (remove-hook 'gptel-post-response-functions #'gptel-ui--schedule t)
+  (remove-hook 'kill-buffer-hook #'gptel-ui--cleanup t)
+  (remove-hook 'change-major-mode-hook #'gptel-ui--disable t))
+
 ;;;###autoload
 (define-minor-mode gptel-ui-mode
   "A spacious, navigable reading view for Org and Markdown chats.
@@ -931,10 +940,7 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
     (gptel-ui--restore-header-status)
     (gptel-ui--cleanup)
     (remove-function (local 'filter-buffer-substring-function) #'gptel-ui--filter-copy)
-    (remove-hook 'gptel-post-stream-hook #'gptel-ui--schedule t)
-    (remove-hook 'gptel-post-response-functions #'gptel-ui--schedule t)
-    (remove-hook 'kill-buffer-hook #'gptel-ui--cleanup t)
-    (remove-hook 'change-major-mode-hook #'gptel-ui--disable t)
+    (gptel-ui--remove-local-hooks)
     (when gptel-ui--face-cookie
       (face-remap-remove-relative gptel-ui--face-cookie)
       (setq gptel-ui--face-cookie nil))
@@ -1028,13 +1034,31 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
         (when (local-variable-p hook)
           (set hook (copy-sequence (symbol-value hook))))))))
 
+(defun gptel-ui--with-inline-prompt (open &rest args)
+  "Call OPEN with ARGS while identifying its new indirect buffer as a prompt."
+  ;; The clone hooks run before gptel-inline narrows the prompt and sets its
+  ;; context.  The backing chat still gets its ordinary reading view.
+  (let ((gptel-ui--creating-inline-prompt t))
+    (apply open args)))
+
+(with-eval-after-load 'gptel-inline
+  (advice-add 'gptel-inline :around #'gptel-ui--with-inline-prompt))
+
 (defun gptel-ui--clone-enable ()
   "Rebuild the cloned view after other packages have detached native state."
   (when gptel-ui--clone-state
     (let ((highlight (car gptel-ui--clone-state)))
       (setq gptel-ui--clone-state nil)
-      (gptel-ui-mode 1)
-      (setq gptel-ui--highlight-was-on highlight))))
+      (if (and gptel-ui--creating-inline-prompt (buffer-base-buffer))
+          (progn
+            ;; The early clone hook already restored the native header.
+            ;; Release copied hooks without touching the backing chat's view.
+            (gptel-ui--unwatch-text)
+            (gptel-ui--remove-local-hooks)
+            (when (and highlight (bound-and-true-p gptel-mode))
+              (gptel-highlight-mode 1)))
+        (gptel-ui-mode 1)
+        (setq gptel-ui--highlight-was-on highlight)))))
 
 ;; Run before other packages' clone hooks can refresh or close the new chat.
 (add-hook 'clone-buffer-hook #'gptel-ui--clone -100)
@@ -1044,7 +1068,9 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
 
 (defun gptel-ui--maybe-enable ()
   "Follow gptel's minor mode in conversation buffers."
-  (if (bound-and-true-p gptel-mode) (gptel-ui-mode 1)
+  (if (bound-and-true-p gptel-mode)
+      (unless (and (buffer-base-buffer) (bound-and-true-p gptel-inline--context))
+        (gptel-ui-mode 1))
     (when gptel-ui-mode
       ;; gptel has already restored its pre-chat header before this hook.
       (let ((header header-line-format))
@@ -1060,7 +1086,7 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
         (add-hook 'gptel-mode-hook #'gptel-ui--maybe-enable t)
         (dolist (buffer (buffer-list))
           (with-current-buffer buffer
-            (when (bound-and-true-p gptel-mode) (gptel-ui-mode 1)))))
+            (when (bound-and-true-p gptel-mode) (gptel-ui--maybe-enable)))))
     (remove-hook 'gptel-mode-hook #'gptel-ui--maybe-enable)
     (dolist (buffer (buffer-list))
       (with-current-buffer buffer
