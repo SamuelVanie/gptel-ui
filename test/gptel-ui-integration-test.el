@@ -8,6 +8,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'ert-x)
 (require 'cl-lib)
 (require 'org)
 (require 'markdown-mode)
@@ -137,7 +138,9 @@
                 (when global-first (gptel-ui-global-mode 1))
                 ;; The real command creates the chat, clones it, and only
                 ;; then installs the prompt's keymap, header and context.
-                (let* ((prompt (gptel-inline nil chat-name))
+                (let* ((prompt (ert-with-message-capture messages
+                                 (prog1 (gptel-inline nil chat-name)
+                                   (should-not (string-match-p "Not enabling jit-lock" messages)))))
                        (chat (get-buffer chat-name))
                        (prompt-header header-line-format))
                   (should (eq (current-buffer) prompt))
@@ -146,7 +149,8 @@
                   (should (eq (buffer-base-buffer) chat))
                   (should (buffer-narrowed-p))
                   (should-not gptel-ui-mode)
-                  (should gptel-highlight-mode)
+                  ;; Only a prompt cloned before Atelier inherits active highlighting.
+                  (should (eq gptel-highlight-mode (not global-first)))
                   (should (eq header-line-format prompt-header))
                   (should (nth 2 header-line-format))
                   (should (eq (key-binding (kbd "C-c C-v")) #'gptel-inline-visit-buffer))

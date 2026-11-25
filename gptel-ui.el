@@ -1055,8 +1055,8 @@ Use `gptel-ui-toggle-source' to view or edit the raw source."
             ;; Release copied hooks without touching the backing chat's view.
             (gptel-ui--unwatch-text)
             (gptel-ui--remove-local-hooks)
-            (when (and highlight (bound-and-true-p gptel-mode))
-              (gptel-highlight-mode 1)))
+            ;; Only the backing chat can restore its JIT-based highlighter.
+            (setq gptel-ui--highlight-was-on nil))
         (gptel-ui-mode 1)
         (setq gptel-ui--highlight-was-on highlight)))))
 
